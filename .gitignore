@@ -1,0 +1,9 @@
+node_modules/
+lib/
+*.tsbuildinfo
+.scratch/
+.reference/
+*.log
+.dsh-file-attachment/
+.tmp-*
+test-report.txt
