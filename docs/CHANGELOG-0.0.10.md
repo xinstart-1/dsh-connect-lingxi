@@ -10,7 +10,7 @@
 node scripts/capture-plans.mjs
 ```
 
-新脚本只读、不消耗智点，把每个条目的全部字段打出来并落成
+新脚本只读，把每个条目的全部字段打出来并落成
 `.scratch/plans-normalized.json`。`STATIC_CATALOG` 现在逐字段来自这份输出，
 并有 `.scratch/verify-parity.mjs` 做逐字段比对（含顺序），结果为「完全一致」。
 
