@@ -28,7 +28,10 @@ import { needsFor, performOneTimeTasks } from '../protocol/onetime.ts';
 import { BASE } from '../constants.ts';
 import type { LingxiModel } from '../protocol/catalog.ts';
 import { POLL_INTERVAL_CHOICES, type LingxiPluginState } from '../state.ts';
+import { imageEnabled } from './model-flags.ts';
 import type {
+  StatusAccount,
+  StatusAccountPool,
   StatusCredits,
   StatusDocument,
   StatusModel,
@@ -66,6 +69,37 @@ export interface RuntimeOptions {
   signal?: AbortSignal;
   /** 主动登录的实现（拉起浏览器）。不提供时 `login` 动作报「未配置」。 */
   login?: () => Promise<{ ok: boolean; message: string }>;
+  /** 忘掉插件仓库里的登录态（不动浏览器 / 客户端自己的登录）。不提供时 `logout` 报「未配置」。 */
+  logout?: () => Promise<{ ok: boolean; message: string }>;
+  /** 切换当前账号（只改选择，不动账号内容）。不提供时 `switch-account` 报「未配置」。 */
+  switchAccount?: (accountId: string) => Promise<{ ok: boolean; message: string }>;
+  /**
+   * 账号池视图（脱敏）。
+   *
+   * 由插件提供而不是 runtime 自己读仓库：runtime 不该知道凭据存在哪。
+   * 不提供时状态文档里 `accounts` 是空数组（旧行为）。
+   */
+  accounts?: () => Promise<StatusAccount[]>;
+  /** 「用户选中的账号已不存在」——卡片用它解释状态，而不是笼统提示重新登录。 */
+  accountsLost?: () => Promise<boolean>;
+  /** 账号池的开关状态（常驻，即使只有一个账号也返回）。 */
+  accountPool?: () => Promise<StatusAccountPool>;
+  /** 勾选进池的账号（id + 显示名），批量操作用。 */
+  poolAccounts?: () => Promise<Array<{ id: string; name: string }>>;
+  /** 给单个账号签到（批量签到逐个调用它）。 */
+  claimFor?: (accountId: string) => Promise<{ ok: boolean; message?: string }>;
+  /** 测单个账号是否可用（一次最小对话）。 */
+  testAccount?: (accountId: string) => Promise<{ ok: boolean; message?: string }>;
+  /**
+   * 读单个账号的余额（只读，不产生用量、不走对话）。
+   *
+   * 与 `testAccount` 分开：测通道可用性会产生用量，读余额不会。
+   * 失败时把原因给出来，弹层里那一行显示成红字「读不到 + 原因」，
+   * 而不是一个看起来像 0 的破折号。
+   */
+  accountBalance?: (
+    accountId: string,
+  ) => Promise<{ credits?: number; error?: string }>;
 }
 
 /** 一段带时间戳的缓存。 */
@@ -98,6 +132,7 @@ export class LingxiRuntime {
   private lastError?: string;
   /** 签到 / 领取进行中，防止两次轮询同时发起领取。 */
   private claiming = false;
+  private testing = false;
   /** 登录窗口已打开（避免用户连点两次拉起两个浏览器）。 */
   private loggingIn = false;
   /** 主动动作触发的强制刷新，避免与轮询并发跑同一份请求。 */
@@ -163,6 +198,16 @@ export class LingxiRuntime {
         return { ok: true, status: await this.status(true) };
       case 'login':
         return this.login();
+      case 'logout':
+        return this.logout();
+      case 'switch-account':
+        return this.switchAccount(body);
+      case 'claim-pool-checkin':
+        return this.claimPoolCheckin();
+      case 'test-pool-accounts':
+        return this.testPoolAccounts();
+      case 'account-balances':
+        return this.accountBalances();
       case 'claim-checkin':
         return this.claimCheckin();
       case 'claim-one-time':
@@ -197,6 +242,192 @@ export class LingxiRuntime {
       return { ok: false, error: messageOf(error) };
     } finally {
       this.loggingIn = false;
+    }
+  }
+
+  /**
+   * 切换当前账号。
+   *
+   * 只改「选择」标记，不动任何账号内容 —— 改选择不该重写凭据，否则两个账号
+   * 同时刷新时会互相覆盖。
+   */
+  private async switchAccount(body: Record<string, unknown>): Promise<unknown> {
+    if (this.options.switchAccount === undefined) {
+      return { ok: false, error: '未配置账号切换实现' };
+    }
+    const accountId = typeof body.accountId === 'string' ? body.accountId.trim() : '';
+    if (accountId === '') return { ok: false, error: '缺少 accountId' };
+    try {
+      const result = await this.options.switchAccount(accountId);
+      if (result.ok) this.invalidate();
+      return { ...result, status: await this.status(false) };
+    } catch (error) {
+      this.lastError = messageOf(error);
+      return { ok: false, error: messageOf(error) };
+    }
+  }
+
+  /**
+   * 给勾选进池的账号逐个签到。
+   *
+   * 与单账号签到共用同一套判断（已签到的跳过、只碰可领的），但**逐账号独立**：
+   * 一个账号失败不影响其它账号，最后汇总报告。
+   *
+   * 这是写操作（会改变账号状态），只在用户点按钮时执行。
+   */
+  private async claimPoolCheckin(): Promise<unknown> {
+    if (this.options.poolAccounts === undefined) {
+      return { ok: false, error: '未配置账号池实现' };
+    }
+    if (this.claiming) return { ok: false, error: '正在领取中，请稍候' };
+    this.claiming = true;
+    try {
+      const accounts = await this.options.poolAccounts();
+      if (accounts.length === 0) {
+        return { ok: false, error: '账号池里没有勾选任何账号' };
+      }
+      const lines: string[] = [];
+      let claimed = 0;
+      let already = 0;
+      let failed = 0;
+      for (const account of accounts) {
+        try {
+          const result = (await this.options.claimFor?.(account.id)) ?? {
+            ok: false,
+            message: '未配置单账号签到',
+          };
+          if (result.ok) {
+            claimed += 1;
+            lines.push(`${account.name}：${result.message ?? '已签到'}`);
+          } else if ((result.message ?? '').includes('已签到')) {
+            already += 1;
+            lines.push(`${account.name}：今日已签到`);
+          } else {
+            failed += 1;
+            lines.push(`${account.name}：${result.message ?? '失败'}`);
+          }
+        } catch (error) {
+          failed += 1;
+          lines.push(`${account.name}：${messageOf(error)}`);
+        }
+      }
+      this.lastError = failed === 0 ? undefined : `${failed} 个账号签到失败`;
+      return {
+        ok: failed === 0,
+        // 汇总数字放在最前面：用户先想知道「几个成功」。
+        message: `签到完成：${claimed} 个领取成功，${already} 个今日已签，${failed} 个失败`,
+        details: lines,
+        status: await this.status(true),
+      };
+    } finally {
+      this.claiming = false;
+    }
+  }
+
+  /**
+   * 逐个测勾选的账号是否还能用。
+   *
+   * 判据是**一次最小对话**能否成功（与 WorkBuddy 的「测试勾选的账号」同义）：
+   * 余额接口 200 不代表对话通道可用，真正能测出问题的是走一次对话。
+   *
+   * 会消耗少量智点，所以只在用户点按钮时执行，并在结果里如实报告。
+   */
+  private async testPoolAccounts(): Promise<unknown> {
+    if (this.options.testAccount === undefined) {
+      return { ok: false, error: '未配置账号测试实现' };
+    }
+    if (this.testing) return { ok: false, error: '正在测试中，请稍候' };
+    this.testing = true;
+    try {
+      const accounts = (await this.options.poolAccounts?.()) ?? [];
+      if (accounts.length === 0) {
+        return { ok: false, error: '账号池里没有勾选任何账号' };
+      }
+      const lines: string[] = [];
+      let usable = 0;
+      let broken = 0;
+      for (const account of accounts) {
+        try {
+          const result = await this.options.testAccount(account.id);
+          if (result.ok) {
+            usable += 1;
+            lines.push(`${account.name}：可用`);
+          } else {
+            broken += 1;
+            lines.push(`${account.name}：${result.message}`);
+          }
+        } catch (error) {
+          broken += 1;
+          lines.push(`${account.name}：${messageOf(error)}`);
+        }
+      }
+      return {
+        ok: broken === 0,
+        message: `测试完成：${usable} 个可用，${broken} 个不可用`,
+        details: lines,
+        status: await this.status(false),
+      };
+    } finally {
+      this.testing = false;
+    }
+  }
+
+  /**
+   * 逐个读**所有**已保存账号的余额，给输入框弹出的账号表格用。
+   *
+   * 为什么不塞进状态轮询：状态每 5 分钟拉一次，账号有 N 个就变成 N 倍的上游请求，
+   * 而灵犀按设备限流 —— 多账号轮询正好是最容易踩线的用法。所以这份数据只在
+   * 用户**点开弹层**时读，一次一份，读完就丢，不进缓存。
+   *
+   * 串行而不是并发：并发 N 个请求对同一个设备指纹更像异常流量。
+   * N 个账号逐个读、每个失败单独记原因 —— 一个账号读不到，不该让整张表变成空的。
+   */
+  private async accountBalances(): Promise<unknown> {
+    if (this.options.accounts === undefined) {
+      return { ok: false, error: '未配置账号列表实现' };
+    }
+    if (this.options.accountBalance === undefined) {
+      return { ok: false, error: '未配置账号读余额实现' };
+    }
+    const accounts = await this.options.accounts();
+    const rows: Array<Record<string, unknown>> = [];
+    for (const account of accounts) {
+      const row: Record<string, unknown> = {
+        id: account.id,
+        name: account.name,
+        current: account.current,
+        selected: account.selected,
+        enabled: account.enabled,
+      };
+      try {
+        const read = await this.options.accountBalance(account.id);
+        if (read.error !== undefined) row.creditsError = read.error;
+        if (read.credits !== undefined) row.credits = read.credits;
+      } catch (error) {
+        row.creditsError = messageOf(error);
+      }
+      rows.push(row);
+    }
+    return { ok: true, accounts: rows, readAtMs: this.now() };
+  }
+
+  /**
+   * 登出：只清插件仓库里那份登录态。
+   *
+   * 为什么不去清浏览器/客户端的 cookie：那是用户的登录，不是插件的配置。
+   * 插件能做的、该做的，只是「下次不再用它」。
+   */
+  private async logout(): Promise<unknown> {
+    if (this.options.logout === undefined) {
+      return { ok: false, error: '未配置登出实现' };
+    }
+    try {
+      const result = await this.options.logout();
+      if (result.ok) this.invalidate();
+      return { ...result, status: await this.status(false) };
+    } catch (error) {
+      this.lastError = messageOf(error);
+      return { ok: false, error: messageOf(error) };
     }
   }
 
@@ -357,7 +588,39 @@ export class LingxiRuntime {
         (id): id is string => typeof id === 'string' && id.trim() !== '',
       );
     }
+    if (Array.isArray(body.imageOffModels)) {
+      patch.imageOffModels = body.imageOffModels.filter(
+        (id): id is string => typeof id === 'string' && id.trim() !== '',
+      );
+    }
+    if (Array.isArray(body.imageOnModels)) {
+      patch.imageOnModels = body.imageOnModels.filter(
+        (id): id is string => typeof id === 'string' && id.trim() !== '',
+      );
+    }
+    // 账号池的几个开关。`enabledAccounts` 只收字符串 id，不接受 "all" 这类
+    // 魔法值 —— 显式传完整名单，避免「空名单 = 全选」这种歧义。
+    if (typeof body.accountPoolEnabled === 'boolean') {
+      patch.accountPoolEnabled = body.accountPoolEnabled;
+    }
+    if (Array.isArray(body.enabledAccounts)) {
+      patch.enabledAccounts = body.enabledAccounts.filter(
+        (id): id is string => typeof id === 'string' && id.trim() !== '',
+      );
+    }
+    if (body.deviceHeaderMode === 'real' || body.deviceHeaderMode === 'virtual') {
+      patch.deviceHeaderMode = body.deviceHeaderMode;
+    }
     if (Object.keys(patch).length === 0) return { ok: false, error: '没有可更新的字段' };
+    // 一个都不剩不是「用户想要的配置」，是「选择器里没有灵犀了」：
+    // 界面上最后一行是禁用的，但状态可能比界面新（另一个窗口刚关掉一个），
+    // 所以宿主这边再挡一次，并如实说明为什么没改。
+    if (patch.disabledModels !== undefined) {
+      const known = (this.models?.value ?? this.options.fallbackCatalog()).map((model) => model.id);
+      if (known.length > 0 && known.every((id) => patch.disabledModels?.includes(id) === true)) {
+        return { ok: false, error: '至少保留一个模型：全关掉之后模型选择器里就没有灵犀了' };
+      }
+    }
     const next = await this.options.saveState(patch);
     // 刷新间隔变了，轮询节奏必须跟着变；否则要等下一次重启才生效。
     if (patch.pollIntervalMs !== undefined) {
@@ -595,6 +858,13 @@ export class LingxiRuntime {
         checkedInToday: daily?.status === 'claimed',
       },
       models: models.map((model) => toStatusModel(model, state)),
+      accounts: this.options.accounts === undefined ? [] : await this.options.accounts(),
+      accountPool:
+        this.options.accountPool === undefined
+          ? { enabled: false, total: 0, selected: 0, deviceMode: 'virtual' as const }
+          : await this.options.accountPool(),
+      selectionLost:
+        this.options.accountsLost === undefined ? false : await this.options.accountsLost(),
       settings: {
         autoCheckin: state?.autoCheckin === true,
         pollIntervalMs:
@@ -604,6 +874,8 @@ export class LingxiRuntime {
         composerPill: state?.composerPill !== false,
         sidebarPanel: state?.sidebarPanel === true,
         disabledModels: state?.disabledModels ?? [],
+        imageOffModels: state?.imageOffModels ?? [],
+        imageOnModels: state?.imageOnModels ?? [],
       },
       readAtMs: times.length === 0 ? this.now() : Math.min(...times),
       ...(this.lastError === undefined ? {} : { lastError: this.lastError }),
@@ -650,7 +922,7 @@ function toStatusTask(task: LingxiTask): StatusTask {
   };
 }
 
-/** 目录条目 → 状态文档（启用状态来自插件状态的禁用名单）。 */
+/** 目录条目 → 状态文档（启用状态来自插件状态的禁用名单，图片是生效后的值）。 */
 function toStatusModel(model: LingxiModel, state: LingxiPluginState | undefined): StatusModel {
   const disabled = state?.disabledModels ?? [];
   return {
@@ -660,7 +932,14 @@ function toStatusModel(model: LingxiModel, state: LingxiPluginState | undefined)
     contextWindow: model.contextWindow,
     maxTokens: model.maxTokens,
     reasoning: model.reasoning,
-    vision: model.vision,
+    // 卡片要显示的是**下一次请求真的会用的能力**，不是上游目录的原始声明：
+    // 用户在卡片上关掉图片后，这一行必须立刻变成「不支持图片」。
+    vision: imageEnabled(model, state),
+    visionNative: model.vision,
     enabled: !disabled.includes(model.id),
+    // 官网的徽标与说明原样带到卡片：三个界面（官网 / 选择器 / 卡片）对同一个
+    // 模型的描述必须是同一句话，否则用户会以为其中一个是旧数据。
+    ...(model.badge === undefined ? {} : { badge: model.badge }),
+    ...(model.description === undefined ? {} : { description: model.description }),
   };
 }

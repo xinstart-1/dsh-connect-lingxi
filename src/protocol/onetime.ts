@@ -187,7 +187,7 @@ export async function putExecutionStatus(
 /**
  * 跑一次「带使用信号」的任务对话。
  *
- * 与普通对话的区别只有三处：`client_type`（让上游把这次算成客户端使用）、
+ * 与普通对话的区别只有三处：`client_type`（声明客户端来源）、
  * `session_mode` / `current_mode`（专家模式），以及**两次 execution_status 上报**。
  *
  * @returns 会话 id 与是否成功（失败也回报 sessionId，便于诊断）。

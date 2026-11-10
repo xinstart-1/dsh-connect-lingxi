@@ -41,6 +41,26 @@ const AUDIT_MARKERS = [
   'sensitive',
 ] as const;
 
+/**
+ * 参与审核判定的**诊断字段**。
+ *
+ * 必须白名单，不能把整帧序列化后匹配：`choices[].text` / `reasoning_content`
+ * 是模型正文，出现 "sensitive" 这种英文单词完全正常（真实事故：一次普通
+ * reasoning 里写了 "for the sensitive lines"，整轮对话被判成审核拦截）。
+ */
+const AUDIT_FIELDS = [
+  'code',
+  'message',
+  'msg',
+  'errmsg',
+  'error_msg',
+  'err_msg',
+  'errorMessage',
+  'error',
+  'detail',
+  'reason',
+] as const;
+
 /** 登录失效的文案标记（只在 401/403 时参与判定）。 */
 const AUTH_MARKERS = /unauthor|登录|凭据|credential|cookie|sid|expired/i;
 
@@ -56,12 +76,45 @@ export function textOfPayload(value: unknown): string {
 }
 
 /**
- * 判断一个响应体是不是审核拦截。`code`、`message`、`data` 任一命中即算。
+ * 把一帧里**只有诊断意义**的那部分压成文本，供审核判定使用。
+ *
+ * 只看 {@link AUDIT_FIELDS}：模型正文（`choices[].text` / `reasoning_content`）
+ * 一律不参与，否则正文里出现 `sensitive` 这种普通英文词就会误判。
+ */
+function auditTextOf(value: unknown): string {
+  if (typeof value === 'string') return value.slice(0, 400);
+  if (typeof value !== 'object' || value === null) return '';
+  const record = value as Record<string, unknown>;
+  const parts: string[] = [];
+  for (const key of AUDIT_FIELDS) {
+    const field = record[key];
+    if (field === undefined || field === null || field === '') continue;
+    // 嵌套对象只取一层：`error: { code, message }` 这种上游很常见。
+    if (typeof field === 'object') {
+      const nested = field as Record<string, unknown>;
+      for (const innerKey of AUDIT_FIELDS) {
+        const inner = nested[innerKey];
+        if (inner === undefined || inner === null || inner === '') continue;
+        if (typeof inner === 'object') continue;
+        parts.push(String(inner));
+      }
+      continue;
+    }
+    parts.push(String(field));
+  }
+  // `data` 可能是本次补全本身，只在它是纯字符串时才看。
+  if (typeof record.data === 'string' && record.data !== '') parts.push(record.data);
+  return parts.join(' | ').slice(0, 400);
+}
+
+/**
+ * 判断一个响应体是不是审核拦截。**只看诊断字段**，`code`、`message`、`data`
+ * 等任一命中即算；模型正文不参与。
  * @param value - 上游 JSON 或纯文本。
  * @returns 是审核拦截时为 true。
  */
 export function isAuditPayload(value: unknown): boolean {
-  const text = textOfPayload(value).toLowerCase();
+  const text = auditTextOf(value).toLowerCase();
   if (text === '') return false;
   return AUDIT_MARKERS.some((marker) => text.includes(marker));
 }

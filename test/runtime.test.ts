@@ -275,6 +275,41 @@ test('改设置：刷新间隔只接受五档', async () => {
   runtime.dispose();
 });
 
+test('改设置：逐模型图片开关会写进状态文档，并改变生效后的 vision', async () => {
+  const { client } = fakeClient();
+  const { runtime, saves } = runtimeWith({ client });
+  await runtime.status(true);
+  // FALLBACK 里唯一的模型上游声明支持图片。
+  await runtime.run('settings', { imageOffModels: ['deepseek-v4.1-flash'] });
+  assert.deepEqual(saves, [{ imageOffModels: ['deepseek-v4.1-flash'] }]);
+  const status = await runtime.status(false);
+  assert.equal(status.models[0]?.vision, false, '关掉后生效值必须跟着变');
+  assert.equal(status.models[0]?.visionNative, true, '上游声明要原样留着，卡片才能解释为什么');
+  assert.deepEqual(status.settings.imageOffModels, ['deepseek-v4.1-flash']);
+  runtime.dispose();
+});
+
+test('改设置：图片名单里的非字符串被丢掉', async () => {
+  const { client } = fakeClient();
+  const { runtime, saves } = runtimeWith({ client });
+  await runtime.run('settings', { imageOnModels: ['kimi-k3', '', 42, null] });
+  assert.deepEqual(saves, [{ imageOnModels: ['kimi-k3'] }]);
+  runtime.dispose();
+});
+
+test('改设置：不许把所有模型都关掉', async () => {
+  const { client } = fakeClient();
+  const { runtime, saves } = runtimeWith({ client });
+  await runtime.status(true);
+  const result = (await runtime.run('settings', {
+    disabledModels: ['deepseek-v4.1-flash'],
+  })) as { ok: boolean; error?: string };
+  assert.equal(result.ok, false, '全关掉会让选择器里一个灵犀模型都不剩');
+  assert.match(result.error ?? '', /至少保留一个模型/);
+  assert.equal(saves.length, 0, '被拒绝的写入不该落盘');
+  runtime.dispose();
+});
+
 test('未知动作返回 ok:false 而不抛', async () => {
   const { client } = fakeClient();
   const { runtime } = runtimeWith({ client });
@@ -406,4 +441,61 @@ test('自动签到关闭时不领，打开时才领', async () => {
   await runtimeOn.status(true);
   assert.deepEqual(claimsOn, [], 'status 本身不触发自动签到');
   runtimeOn.dispose();
+});
+
+test('账号余额表逐个读，读不到的那一行带原因而不是 0', async () => {
+  // 弹层里那张表：一个账号读得到余额，一个账号上游拒绝。整张表不能因为
+  // 一个账号失败就空掉，也不能把「读不到」画成「0」——那会被当成余额真的没了。
+  const { client } = fakeClient();
+  const asked: string[] = [];
+  const runtime = new LingxiRuntime({
+    client,
+    version: '0.0.1',
+    warn: () => {},
+    now: () => NOW,
+    state: async () => ({ ...DEFAULT_STATE, disabledModels: [] }),
+    saveState: async () => ({ ...DEFAULT_STATE, disabledModels: [] }),
+    credential: async () => ({ value: 'wps_sid=abc', source: 'manual' }),
+    fallbackCatalog: () => FALLBACK,
+    accounts: async () => [
+      { id: 'uid-1', name: 'uid-111111111', source: 'login', savedAtMs: NOW, current: true, selected: false, enabled: true },
+      { id: 'uid-2', name: 'uid-222222222', source: 'login', savedAtMs: NOW, current: false, selected: false, enabled: false },
+    ],
+    accountBalance: async (accountId: string) => {
+      asked.push(accountId);
+      if (accountId === 'uid-2') return { error: 'HTTP 401' };
+      return { credits: 1778 };
+    },
+  });
+
+  const result = (await runtime.run('account-balances', {})) as {
+    ok: boolean;
+    accounts: Array<{ id: string; credits?: number; creditsError?: string }>;
+    readAtMs: number;
+  };
+  assert.equal(result.ok, true);
+  assert.deepEqual(asked, ['uid-1', 'uid-2'], '账号要逐个读，不能漏');
+  assert.equal(result.accounts.length, 2, '一个账号读失败不该让整张表消失');
+  assert.equal(result.accounts[0]?.credits, 1778);
+  assert.equal(result.accounts[1]?.credits, undefined, '读不到就是读不到，不是 0');
+  assert.equal(result.accounts[1]?.creditsError, 'HTTP 401');
+  assert.equal(result.readAtMs, NOW, '要带读取时刻，弹层底部要显示「最近刷新」');
+});
+
+test('没配置账号读余额实现时，余额表报错而不是给一张空表', async () => {
+  // 空表会被界面画成「本机还没有保存账号」——那是另一个意思的错误陈述。
+  const { client } = fakeClient();
+  const runtime = new LingxiRuntime({
+    client,
+    version: '0.0.1',
+    warn: () => {},
+    now: () => NOW,
+    state: async () => ({ ...DEFAULT_STATE, disabledModels: [] }),
+    saveState: async () => ({ ...DEFAULT_STATE, disabledModels: [] }),
+    credential: async () => ({ value: 'wps_sid=abc', source: 'manual' }),
+    fallbackCatalog: () => FALLBACK,
+  });
+  const result = (await runtime.run('account-balances', {})) as { ok: boolean; error?: string };
+  assert.equal(result.ok, false);
+  assert.match(result.error ?? '', /未配置/);
 });

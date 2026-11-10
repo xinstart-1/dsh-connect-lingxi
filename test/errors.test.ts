@@ -50,6 +50,42 @@ test('isAuditPayload 认得中英文标记', () => {
   assert.equal(isAuditPayload(undefined), false);
 });
 
+test('模型正文出现 sensitive 不算审核拦截（真实事故回归）', () => {
+  // 现场原帧：code=Success、message 为空，唯一命中 "sensitive" 的是 reasoning 正文。
+  const frame = {
+    code: 'Success',
+    message: '',
+    usage: { completion_tokens: 0, prompt_tokens: 0, total_tokens: 0, cached_tokens: 0 },
+    choices: [
+      {
+        index: 0,
+        finish_reason: '',
+        text: '',
+        reasoning_content:
+          ' a scrub, and check repo visibility via GitHub API using the token. ' +
+          'Steps (parallel): a) grep with context for the sensitive lines in docs/README.',
+      },
+    ],
+  };
+  assert.equal(isAuditPayload(frame), false);
+});
+
+test('正文里的 audit failed / 内容审核 同样不算', () => {
+  assert.equal(
+    isAuditPayload({
+      code: 'Success',
+      choices: [{ text: '日志里写着 audit failed 和 内容审核 两个词，我照抄出来' }],
+    }),
+    false,
+  );
+});
+
+test('嵌套 error 对象里的标记仍然算审核拦截', () => {
+  assert.equal(isAuditPayload({ error: { code: 'AuditFailed', message: 'blocked' } }), true);
+  assert.equal(isAuditPayload({ code: 500, message: '内容被审核拦截' }), true);
+});
+
+
 test('isSuccessCode：缺省与 Success 算成功', () => {
   assert.equal(isSuccessCode(undefined), true);
   assert.equal(isSuccessCode('Success'), true);

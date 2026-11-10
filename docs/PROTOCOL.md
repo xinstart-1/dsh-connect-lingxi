@@ -158,7 +158,25 @@ X-Cc-Run-ID: <run_id>
 | --- | --- |
 | `max_tokens` | `base_llm_arguments.max_tokens` |
 | `reasoning_effort` | 同时写 `reasoning_effort` 和 `llm_arguments.reasoning_effort` |
-| `tools` / `tool_choice` | 原样 |
+| `tools` | 原样（`function.strict` 也收） |
+| `tool_choice` | **只能是字符串**，见下 |
+
+### 3.3.1 两条必须归一掉的形状（2026-11-10 真机实测）
+
+DSH（pi-ai 形状）会发「分段 content」和「对象 tool_choice」，这两种上游都**直接拒**：
+
+| 请求体特征 | 上游响应 | 结论 |
+| --- | --- | --- |
+| `content: [{"type":"text","text":"…"}]`（`user` / `assistant` / `tool` 任一角色） | `400 {"code":"InvalidArgument","message":"参数错误"}` | 只吃字符串，必须展平 |
+| `tool_choice: {"type":"function","function":{"name":"…"}}` | `400 {"code":"InvalidArgument","message":"参数错误"}` | 只吃 `"auto"` / `"none"` / `"required"` |
+| `tools[].function.strict: true` | `200` | 无需处理 |
+| `tool_choice: "auto" | "none" | "required"` | `200` | 字符串形式全部可用 |
+
+同一份内容展平成字符串后立刻 `200`，所以这不是「上游限制」，是请求体形状问题。
+归一逻辑在 `src/protocol/normalize.ts`，由 `buildAgentBody` 调用：
+
+- 分段 `content` → `\n` 拼成字符串；非文本分段（图片等）丢弃并 `onWarn`
+- 对象 `tool_choice` → `"required"`（指定具体函数时）/ `"auto"`（其余），并 `onWarn`
 
 ---
 
@@ -207,7 +225,7 @@ data: [DONE]
 
 | 上游情况 | 状态码 | 语义 |
 | --- | --- | --- |
-| 审核拦截（body 含 audit 标记） | 400 | `audit_blocked`，**不是**登录失效 |
+| 审核拦截（`code` / `message` 等**诊断字段**含 audit 标记） | 400 | `audit_blocked`，**不是**登录失效 |
 | 401 / 403 且文案含 `unauthor\|登录\|凭据\|credential\|cookie\|sid` | 401 | 登录失效 |
 | 401 / 403 其它 | 404 | 映射成模型不存在 |
 | 400 / 404 / 422 | 404 | 模型或参数不对 |
@@ -215,6 +233,11 @@ data: [DONE]
 | 其它 | 502 | 兜底 |
 
 **关键**：只有明确的鉴权失败才报 401。否则会把账号误标成「未登录」并从 provider 列表里摘掉。
+
+**审核判定的范围**：只看 `code` / `message` / `errmsg` / `error` / `detail` / `reason` 等
+诊断字段，`choices[].text` 与 `reasoning_content` 这些**模型正文不参与**。
+曾经的实现把整帧序列化后做子串匹配，正文里出现 `sensitive` 这种普通英文词
+就会误报 `AuditFailed` 并打断流。现在只匹配诊断字段（已修正）。
 
 run 失效（如 `run_id` 过期）→ 删除缓存的 run，重建一次再试（只重试一次）。
 
@@ -232,35 +255,67 @@ run 失效（如 `run_id` 过期）→ 删除缓存的 run，重建一次再试�
 {
   "key": "deepseek-v4.1-flash",
   "name": "DeepSeek V4.1 Flash",
-  "desc": "...",
-  "multiplier": "0.12x",
-  "max_context_tokens": 1048576,
-  "max_new_tokens": 8192,
+  "desc": "",
+  "tag": "NEW",
+  "icon": "...",
+  "multiplier": "～0.12x",
   "support_multimodal": true,
-  "reasoning_efforts": ["low", "high"]
+  "max_context_tokens": 1048576,
+  "max_input_tokens": 1048576,
+  "max_new_tokens": 393216,
+  "intro": "已更新为 1017 最新版本，原生多模态，推理性能全面提升",
+  "reasoning_efforts": ["low", "high", "max"]
 }
 ```
 
+**字段名以真实响应为准**（2026-11-10 抓取，`scripts/capture-plans.mjs` 可复现）：
+
+| 字段 | 含义 | 注意 |
+| --- | --- | --- |
+| `key` | 模型 id | 直接作为 `model_id` 发送 |
+| `name` | 显示名 | |
+| `tag` | 徽标 | **不是 `badge`**；模型用 `tag`，模式没有 |
+| `desc` | 说明 | **所有模型都是空串**，只有模式有值 |
+| `intro` | 详细介绍 | 模型的那句介绍在这里（本插件不展示） |
+| `multiplier` | 倍率 | 混用 ASCII `~` / 全角 `～` / `〜`，解析时归一 |
+| `support_multimodal` | 图片能力 | |
+| `max_context_tokens` | 上下文窗口 | |
+| `max_input_tokens` | 输入上限 | |
+| `max_new_tokens` | **输出上限** | 各模型差别极大（131072 ~ 1048576） |
+| `reasoning_efforts` | 思考档位 | **没有这个字段 = 非思考模型** |
+
+上游给的档位实测只有三种取值 `low` / `high` / `max`（官网显示为低 / 高 / 超高），
+9 个思考模型都是这三档；`mimo-v2.6-pro` / `minimax_m3` / `plan_pro` / `plan_max`
+**不给** `reasoning_efforts`。
+
 ### 6.2 静态兜底（未登录 / 接口失败时）
 
-14 个模型（客户端 1.3.31 对齐）：
+13 项（11 个模型 + 2 个模式），**逐字段抄自一次真实响应**（2026-11-10）：
 
-| id | 名称 | 上下文 | 倍率 | 思考 | 图片 |
-| --- | --- | --- | --- | --- | --- |
-| `auto` | 自动推荐 (Auto) | 1048576 | 1.0x | ✅ | ❌ |
-| `deepseek-v4.1-flash` | DeepSeek V4.1 Flash | 1048576 | 0.12x | ✅ | ✅ |
-| `deepseek-v4-flash-0731` | DeepSeek V4 Flash | 1048576 | 0.09x | ✅ | ❌ |
-| `deepseek-v4-pro-0813` | DeepSeek V4 Pro | 1048576 | 0.40x | ✅ | ❌ |
-| `kimi-k3` | Kimi-K3 | 1048576 | 1.60x | ✅ | ✅ |
-| `GLM-5.3` | GLM-5.3 | 1048576 | 0.75x | ✅ | ❌ |
-| `GLM-5.3-Flash` | GLM-5.3-Flash | 1048576 | 0.11x | ✅ | ✅ |
-| `qwen3.8_max` | Qwen3.8-Max | 1048576 | 0.80x | ✅ | ✅ |
-| `qwen3.8_flash` | Qwen3.8-Flash | 1048576 | 0.08x | ✅ | ✅ |
-| `minimax_m3` | minimax-M3 | 1048576 | 0.20x | ❌ | ✅ |
-| `doubao_seed_2_1_pro_260628` | Doubao-Seed-2.1 Pro | 262144 | 0.50x | ✅ | ✅ |
-| `mimo-v2.6-pro` | Xiaomi MiMo-V2.6 Pro | 1048576 | 0.10x | ❌ | ✅ |
-| `plan_pro` | Pro 模式 (深度推理) | 1048576 | 1.0x | ✅ | ❌ |
-| `plan_max` | Max 模式 (复杂任务) | 1048576 | 1.0x | ✅ | ❌ |
+| id | 名称 | 上下文 | 输出上限 | 倍率 | 思考 | 图片 | 徽标 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `plan_pro` | Pro 模式 | 1048576 | 131072 | — | ❌ | ✅ | |
+| `plan_max` | Max 模式 | 1048576 | 131072 | — | ❌ | ✅ | |
+| `deepseek-v4.1-flash` | DeepSeek V4.1 Flash | 1048576 | 393216 | ~0.12x | ✅ | ✅ | NEW |
+| `deepseek-v4-pro-0813` | DeepSeek V4 Pro | 1048576 | 393216 | 0.40x | ✅ | ❌ | 正式版 |
+| `qwen3.8_flash` | Qwen3.8-Flash | 1048576 | 131072 | ~0.08x | ✅ | ✅ | |
+| `qwen3.8_max` | Qwen3.8-Max | 1048576 | 131072 | ~0.80x | ✅ | ✅ | |
+| `mimo-v2.6-pro` | Xiaomi MiMo-V2.6 Pro | 1048576 | 131072 | 0.10x | ❌ | ✅ | |
+| `GLM-5.3-Flash` | GLM-5.3-Flash | 1048576 | 131072 | ~0.11x | ✅ | ✅ | 首发接入 |
+| `GLM-5.3` | GLM-5.3 | 1048576 | 131072 | ~0.75x | ✅ | ❌ | 首发接入 |
+| `minimax_m3` | MiniMax-M3 | 1048576 | 524288 | 0.20x | ❌ | ✅ | |
+| `doubao_seed_2_1_pro_260628` | Doubao-Seed-2.1 Pro | 262144 | 262144 | ~0.50x | ✅ | ✅ | |
+| `kimi-k3` | Kimi-K3 | 1048576 | 1048576 | 1.60x | ✅ | ✅ | |
+| `kimi-k3.1-pro` | Kimi-K3.1 Pro | 1048576 | 1048576 | ~1.10x | ✅ | ✅ | NEW |
+
+四个约定：
+
+1. **顺序照上游**：先 `plans`（Pro/Max）后 `models`。
+2. **`maxTokens` 必须照抄**：各模型从 131072 到 1048576 不等，写死一个值
+   会让长回复被截断。
+3. **`reasoning` 以上游声明为准**：没有 `reasoning_efforts` 就是非思考模型。
+4. **官网没有的模型不放进兜底表**：`auto` 与 `deepseek-v4-flash-0731` 上游
+   接口也不返回。
 
 模型 id 归一：去掉 `wps-lingxi/` 前缀；`default` → `deepseek-v4.1-flash`。
 
@@ -541,7 +596,7 @@ PUT  .../execution_status               completed
 ```
 
 - 模型固定 `plan_pro`（网页端一致）。
-- `max_tokens: 4096`：上游按用量扣智点（整数余额），回答太短可能凑不够 1 智点而不产生计费记录。
+- `max_tokens: 4096`：回答过短时上游可能无法确认本次会话产生了有效使用，任务因此不翻转。
 - 话术不能用「hi」这类裸词（cowork 风控会拒）：用
   `请用两三句话介绍一下你自己，包括你擅长的任务类型`。
 

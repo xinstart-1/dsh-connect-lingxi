@@ -1,7 +1,7 @@
 # dsh-connect-lingxi
 
 > 把 **WPS 灵犀（Lingxi Claw）** 接入 **DeepSeek Harness**：原生 `tools` / `tool_calls` /
-> `reasoning_content` / `usage` 直通，14 个模型直接出现在 DSH 的模型选择器里。
+> `reasoning_content` / `usage` 直通，官网那 11 个模型 + 2 个模式直接出现在 DSH 的模型选择器里。
 > **v0.0.1 起**，插件详情页还会告诉你智点余额、快过期的临时积分、今天签没签到，
 > 输入框左侧有一枚可点的读数。
 
@@ -16,23 +16,33 @@
 
 ## 能力
 
-- **14 个模型**：DeepSeek V4.1 Flash（1M 上下文，0.12x 倍率）、V4 Pro、Kimi-K3、
-  GLM-5.3 / 5.3-Flash、Qwen3.8-Max / Flash、minimax-M3、Doubao-Seed-2.1 Pro、
-  MiMo-V2.6 Pro、Auto / Pro / Max 模式。
+- **逐字段对齐上游的模型清单**：11 个模型 + Pro / Max 两个模式，上下文、输出上限、
+  倍率、徽标（`NEW` / `正式版` / `首发接入`）、思考档位全部来自一次真实
+  `/sessions/plans` 响应（`node scripts/capture-plans.mjs` 可复现核对）。
+  思考档位按上游声明露出：9 个思考模型各 3 档（低 / 高 / 超高），
+  4 个非思考模型没有开关。
 - **原生工具调用**：上游返回的 `tool_calls` 直接进 DSH 的工具循环。
 - **思考过程**：`reasoning_content` 独立通道，不混进正文。
 - **动态模型目录**：登录后从 `/api/aioffice/v1/sessions/plans` 拉取账号真实目录，
   跟随灵犀上下架；未登录时用静态兜底表。
-- **凭证不出本机**：只存 DSH 凭据库（加密落盘），不进代码、不进仓库、不打日志。
+- **凭证不出本机**：存在 `$DSH_HOME/lingxi-vault/credential.json`（权限 0600，
+  重载/更新/重装都不丢），不进代码、不进仓库、不打日志，也永不进浏览器半边。
 - **智点余额**：设置卡片实时显示剩余额度。**新增**：还会单独算出「15 天内会过期」的
   那部分——总额里看不出「有多少马上作废」，而那是真正该急着用的。
 - **每日签到 / 一次性任务**（新）：卡片上有签到按钮，点一下就领。已签到不会重复发写请求。
   三个一次性任务**都能做**：专家模式与客户端由一次带 `client_type` / `session_mode`
   的对话带出，群聊任务走「WS 使用信号 → 建群 → 立刻解散」——都靠
   `execution_status` 生命周期上报，`docs/PROTOCOL.md` §13 有完整流程。
-- **模型目录与倍率**（新）：卡片列出每个模型的名称、倍率、上下文、思考/图片支持与启用状态。
-- **输入框读数**（新）：输入框左侧一枚胶囊（`灵犀 · 1,072`），点了弹出余额与到期提醒。
-- **界面开关**（新）：自动签到 / 胶囊 / 侧栏入口 / 刷新间隔（1·5·10·30·60 分钟），
+- **模型目录与倍率**：卡片列出每个模型的名称、倍率、上下文、思考/图片支持与启用状态。
+- **逐模型开关**（新）：模型页每行两个勾选框 —— **启用**（决定它出不出现在 DSH 的
+  模型选择器里）与**图片**（决定它能不能接收图片输入）。点一下即生效，不用去
+  「设置 → 模型」走「保存 → 重载插件」；至少保留一个模型。
+- **输入框读数**：输入框左侧一枚胶囊（`灵犀 · 1,072`），点了弹出余额与到期提醒，
+  以及一个「打开灵犀面板」入口。
+- **侧栏整页**（新）：开关打开后侧栏多一项「WPS 灵犀」，点进去是**分页**的整页
+  （账号 / 模型 / 任务 / 设置 / 诊断），卡片分组，和 `dsh-connect-workbuddy` 一个样式。
+  **关掉开关只是收起导航行，页面照常在册**——所以胶囊那个入口永远能打开它。
+- **界面开关**：自动签到 / 胶囊 / 侧栏入口 / 刷新间隔（1·5·10·30·60 分钟），
   点一下即生效，不走「保存」。
 
 ## 安装
@@ -83,7 +93,24 @@ shim 用 `node:http` 监听 `listen(0, "127.0.0.1")`——内核随机分配端�
 | `@kevinfx/magpie-wps-lingxi` | 同一协议，但走 Magpie 网关（多一跳） |
 
 本插件不依赖 Magpie。与 workbuddy 的功能差异见
-[`docs/CHANGELOG-0.0.1.md`](docs/CHANGELOG-0.0.1.md#与-workbuddy-的差异有意为之)。
+[`docs/CHANGELOG-0.0.1.md`](docs/CHANGELOG-0.0.1.md#与-workbuddy-的差异有意为之)；
+0.0.5 把侧栏整页与插件页样式对齐到 workbuddy 的做法，记录在
+[`docs/CHANGELOG-0.0.5.md`](docs/CHANGELOG-0.0.5.md)；0.0.6 补上模型页的
+逐模型「启用 / 图片」勾选（[`docs/CHANGELOG-0.0.6.md`](docs/CHANGELOG-0.0.6.md)），
+0.0.7 修掉「勾了不生效」—— 缺的是 `llm/models-updated` 事件
+（[`docs/CHANGELOG-0.0.7.md`](docs/CHANGELOG-0.0.7.md)）；0.0.8 让登录态跨重载/更新
+保留 —— 自建凭据仓库 `$DSH_HOME/lingxi-vault/`
+（[`docs/CHANGELOG-0.0.8.md`](docs/CHANGELOG-0.0.8.md)）；0.0.9 让模型清单、顺序、
+倍率与徽标与灵犀官网一致（[`docs/CHANGELOG-0.0.9.md`](docs/CHANGELOG-0.0.9.md)）；
+0.0.10 按真实上游响应逐字段校准，修掉 `maxTokens` 全错与思考档位全开
+（[`docs/CHANGELOG-0.0.10.md`](docs/CHANGELOG-0.0.10.md)）；0.0.11 接上宿主的附件服务，
+修掉发图报 `UNSUPPORTED_CONTENT`（[`docs/CHANGELOG-0.0.11.md`](docs/CHANGELOG-0.0.11.md)）；0.0.12 加上账号池
+（多账号各存一份，卡片上点一下就切换，照 `dsh-connect-workbuddy` 的做法）
+（[`docs/CHANGELOG-0.0.12.md`](docs/CHANGELOG-0.0.12.md)）；0.0.13 把账号池做成
+WorkBuddy 那样：常驻显示、逐账号勾选、批量签到与测试、每个账号显示余额
+（[`docs/CHANGELOG-0.0.13.md`](docs/CHANGELOG-0.0.13.md)）；0.0.14 把账号+智点读数
+挪到模型选择器前面，并统一了倍率与徽标的显示
+（[`docs/CHANGELOG-0.0.14.md`](docs/CHANGELOG-0.0.14.md)）。
 
 ## 开发
 

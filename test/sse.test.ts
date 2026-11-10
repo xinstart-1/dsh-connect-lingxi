@@ -157,6 +157,39 @@ test('审核拦截抛错而不是当正常帧吞掉', () => {
   );
 });
 
+test('reasoning 正文里出现 sensitive 时正常流完，不误判成审核拦截', () => {
+  const translator = new LingxiSseTranslator('m');
+  // 现场原帧：code=Success，命中 "sensitive" 的只是 reasoning 正文。
+  const out = translator.push(
+    sse({
+      code: 'Success',
+      message: '',
+      usage: { completion_tokens: 0, prompt_tokens: 0, total_tokens: 0, cached_tokens: 0 },
+      choices: [
+        {
+          index: 0,
+          finish_reason: '',
+          text: '',
+          reasoning_content: ' for the sensitive lines in docs/README and then check repo',
+        },
+      ],
+    }),
+  );
+  out.push(
+    ...translator.push(sse({ code: 'Success', choices: [{ text: '好了', finish_reason: 'stop' }] })),
+  );
+  out.push(...translator.finish());
+
+  const parsed = parse(out);
+  const reasoning = parsed
+    .flatMap((chunk) => (chunk.choices as Record<string, unknown>[]) ?? [])
+    .map((choice) => (choice.delta as Record<string, unknown> | undefined)?.reasoning_content)
+    .filter((value): value is string => typeof value === 'string' && value !== '');
+  assert.equal(reasoning.length, 1);
+  assert.match(reasoning[0] ?? '', /sensitive/);
+});
+
+
 test('非 Success 业务码抛错', () => {
   const translator = new LingxiSseTranslator('m');
   assert.throws(

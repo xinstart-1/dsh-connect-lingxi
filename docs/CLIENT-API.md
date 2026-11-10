@@ -166,7 +166,9 @@ if (entry.locale !== void 0) {
 
 **这把 `t` 从 `inject` 里解放出来** —— 但注意：**三个实测插件仍然用 `inject: () => ({ t })` 传 `t`**（minimax `:564`、workbuddy `:16313`、trae `:10257`）。两种写法都成立；`locale:` 是更干净的路径。
 
-### 1.5 七个目标槽位逐个说明
+### 1.5 目标槽位逐个说明
+
+**【确证】** 下表汇总目标槽位的注册契约；侧栏导航行与主面板分别注册到 `sidebar.panellist` 和 `main`，两者的目录证据与具体行为见下表及对应子节（`dsh-cordis-client-runner/lib/client.js:6228-6274`、`dsh-cordis-client-runner/lib/client.js:4758-4794`）。
 
 `kind` 决定用 `id` 还是 `key`：**`kind: "list" | "single" | "chain"` → 用 `id`；`kind: "keyed"` → 用 `key`。**
 **【确证】** `SlotKind = 'single' | 'list' | 'keyed' | 'chain'`（`runner/lib/client.js:2417`）。
@@ -180,6 +182,8 @@ if (entry.locale !== void 0) {
 | `conversation.input.model.label` | `single` | `session` | **无 registerOptions**（不能用 id/key） | 目录 `:3856-3894` |
 | `plugins.bundle.config` | `keyed` | `root` | **`key`**（= 包名） | 目录 `:4917-4955` |
 | `settings.plugin.item` | — | — | **不存在此槽位** | 全 asar grep `settings\.plugin\.item` → **0 命中** |
+| `sidebar.panellist` | `list` | `root` | **【确证】`id: string` 必需**；`order?: number`（默认 0，升序）；`label?: string \| (() => string)`；公共字段 `locale` | 目录 `dsh-cordis-client-runner/lib/client.js:6228-6274`；`dsh-client-ui-sidebar/lib/client.js:690-695` |
+| `main` | `keyed` | `root` | **【确证】`key: string` 必需**；公共字段 `locale` / `inject` | 目录 `dsh-cordis-client-runner/lib/client.js:4758-4794`；`dsh-cordis-client-runner/lib/client.js:2454` |
 
 > `plugins.detail.section`（`list`，`root`，用 `id`，props `{ subject }`）存在，目录 `:5054-5102`；`plugins.item`（`list`，`root`，用 `id`）目录 `:5103-5156`；`plugins.row.config`（`keyed`，`root`，key = `<包名>#<rowId>`）目录 `:5157-5191`。
 > **`settings.plugin.item` 是笔误/不存在的名字**，实际存在的对应物是 `plugins.item`（Plugins 页的官方插件卡）和 `settings.plugins.tab`。**【确证】3 个包确认无此串**。
@@ -303,6 +307,8 @@ declaredBy: "an entry in 'conversation.input.model' (client-ui-model-selection),
 
 **【确证】** 该插件结论：**注册 `conversation.input.model.label` 必须显式给负 priority**（如 `priority: -1`）以 shadow 官方条目。目录里 `replaceRisk: "shadows-shipped-ui"` 也印证。
 
+**本插件的取舍（0.0.15 起）**：本插件也占这个格子（`priority: -105`），用来把倍率与徽标画在模型名后面（`DeepSeek V4.1 Flash · x0.11` + 徽标）。占住的代价必须讲清楚：宿主自己的官方徽标只在**格子没有占位者**时由宿主画，所以本插件的 `ModelLabel` 对**别人的 provider 行**返回「名字 + 它自己的 `model.badge`」，把它原本要画的东西还回去 —— 只损失样式，不丢信息。`keyed` 宿主上每家 provider 各占一格，退化为按 `provider.id` 注册，那时不存在这个代价。
+
 #### `plugins.bundle.config`
 
 **【确证】** 目录 `:4917-4955`：
@@ -337,6 +343,34 @@ children: renderSlot("plugins.bundle.config", { view: "page" }, { entryKey: pkg.
 **`{ entryKey: pkg.name }`** 是 keyed 槽位的派发方式，与 key = 包名对应。
 
 **注意 `capabilities` 不存在** —— owner props 只有 `view` 和 `form`。**【确证】** 目录原文如上，无 `capabilities` 字段。
+
+#### `sidebar.panellist`
+
+**【确证】** `kind: "list"`、`scope: "root"`；目录的 registerOptions 为必需的 `id: string`、可选的 `order: number` 与 `label: string | (() => string)`，`locale` 是公共字段。`declaredBy` 为 `sidebar` entry（`client-ui-sidebar`），随该 entry 挂载存在；`keyDomain` 为空，id 无枚举限制（`dsh-cordis-client-runner/lib/client.js:6228-6274`；公共字段与 `StoredEntry.options` 见 `dsh-cordis-client-runner/lib/client.js:2454`）。
+
+**【确证】** 宿主传入的渲染 props（owner props）为 **`{ size: number, active: boolean }`**，只把组件当图标渲染，按钮由宿主创建（`dsh-client-ui-sidebar/lib/client.js:206-232`），渲染点 `dsh-client-ui-sidebar/lib/client.js:228`：
+
+```js
+renderSlot('sidebar.panellist', { size: wide ? 16 : 18, active }, { only: id })
+```
+
+**【确证】** 导航行名来自 entry 元数据：宿主读取 `ctx.slots.entriesOfSlot('sidebar.panellist')`，取 `options.id`，以 `options.order ?? 0` 升序排列，以 `resolveSlotLabel(options.label) ?? id` 作为行名（`dsh-client-ui-sidebar/lib/client.js:690-695`）。因此组件返回 `null` 只会留下图标空白但可点的按钮，**隐藏行必须注销 entry**（`dsh-client-ui-sidebar/lib/client.js:206-232`、`dsh-client-ui-sidebar/lib/client.js:690-695`）。
+
+**【确证】** 侧栏行点击调用 `layout.selectPanel(id)`，因此必须存在 **同 key 的 `main` entry**；id 没有枚举限制不代表可以导航到未注册的面板，后者会抛错（`dsh-client-ui-sidebar/lib/client.js:206-232`；`dsh-client-ui-layout/lib/client.js:522-525`；见 §1.8）。
+
+#### `main`
+
+**【确证】** `kind: "keyed"`、`scope: "root"`；registerOptions 要求 **`key: string`**，`locale` / `inject` 是公共字段。`declaredBy` 为 `root` entry（`client-ui-layout`）（`dsh-cordis-client-runner/lib/client.js:4758-4794`；公共字段见 `dsh-cordis-client-runner/lib/client.js:2454`）。
+
+**【确证】** 宿主渲染 props（owner props）为 **`{}`**（`dsh-client-ui-layout/lib/client.js:127`）：
+
+```js
+renderSlot('main', {}, { entryKey: panelId ?? 'conversation' })
+```
+
+**【确证】** `surface: 'page'`、`backToConversation` 不是框架字段，是插件经 `inject` 传入的私有 props，与 §1.3 一致；本项目注入位置为 `src/client/bundle.js:1217-1226`，宿主空 owner props 的证据为 `dsh-client-ui-layout/lib/client.js:127`。
+
+**【确证】** 目录的 keyDomain 只列出已占用的 `conversation`（`dsh-cordis-client-runner/lib/client.js:4758-4794`），运行时还有 `plugins`（`dsh-client-ui-plugin-manager/lib/client.js:7680`、`dsh-client-ui-plugin-manager/lib/client.js:7751`）与 `schedules`（`dsh-client-ui-schedule/lib/client.js:19198`、`dsh-client-ui-schedule/lib/client.js:19361`）。**【推断】** 为避免与宿主面板冲突，不要占用通用词，宜用插件包名作为 key；依据为上述已占用 key，本项目采用 `dsh-connect-lingxi`（`src/client/bundle.js:24`、`src/client/bundle.js:1257-1261`）。
 
 ### 1.6 标准 props（所有槽位都额外收到）
 
@@ -425,6 +459,20 @@ return {
 ```
 
 ---
+
+### 1.8 `layout` 服务：软取与面板切换
+
+**【确证】** `ctx.get(name)` 是 Cordis 的软取写法；使用 `ctx.get('layout')` 探测服务，workbuddy 实测调用见 `dsh-connect-workbuddy/lib/client.js:16255`，本项目的软探测及 `selectPanel` 函数检查见 `src/client/bundle.js:1201-1208`。
+
+**【确证】** 方法签名为 `selectPanel(panelId: string | null): void`，以下行为由服务实现与契约共同确认（`dsh-client-ui-layout/lib/client.js:522-525`、`dsh-cordis-client-runner/lib/client.js:1288-1294`）：
+
+| 参数 / 条件 | 结果 | 证据 |
+|---|---|---|
+| 已注册的 `main` key | 【确证】中间列切换到对应面板 | `dsh-client-ui-layout/lib/client.js:522-525`；渲染点 `dsh-client-ui-layout/lib/client.js:127` |
+| `null` | 【确证】回到对话，不更换 Session | `dsh-cordis-client-runner/lib/client.js:1288-1294`；`dsh-client-ui-layout/lib/client.js:522-525` |
+| 未注册的 id | 【确证】抛出 `layout.selectPanel: main panel "<id>" is not registered`，原选择保持不变 | `dsh-client-ui-layout/lib/client.js:522-525` |
+
+**【确证】** 本项目不硬依赖 `layout`：软探测取不到服务时，不提供 `openPanel` / `backToConversation` 回调，并隐藏「打开面板 / 返回对话」按钮，避免留下点击会抛错的按钮（`src/client/bundle.js:1201-1208`、`src/client/bundle.js:1217-1226`、`src/client/bundle.js:1334-1339`；按钮条件见 `src/client/bundle.js:919-921`、`src/client/bundle.js:1136-1141`）。
 
 ## 2. locale 服务
 
@@ -832,6 +880,16 @@ ctx.inject(["webServer"], (webCtx) => {
 - **判定：`surface` 不是契约；是两个插件各自组件内的私有约定。文档不写它。**
 
 ---
+
+### 5.1 本项目落地：常驻主面板与按需侧栏行
+
+**【确证】** `src/client/bundle.js` 的 `main` 面板常注册，不随侧栏开关注销；key 为 `dsh-connect-lingxi`，`inject` 提供 `{ t, surface: 'page', backToConversation? }`，返回回调仅在软探测到 `layout` 时提供（`src/client/bundle.js:24`、`src/client/bundle.js:1217-1226`、`src/client/bundle.js:1257-1261`）。
+
+**【确证】** `sidebar.panellist` 行只在 `status.settings.sidebarPanel === true` 时注册，关闭即 dispose。实现以 `panelDisposers` 保存注销函数，由 `syncPanelRow()` 同步；`panelRowWanted` 比较前后开关值，只在值真正变化时更新，避免 60 秒轮询带来的无意义重注册；状态尚未读到时直接返回（`src/client/bundle.js:1262-1296`；轮询间隔见 `src/client/bundle.js:28`）。
+
+**【确证】** 插件详情页注入 `surface: 'detail'`，设置页注入 `surface: 'settings'`，两处都不显示返回按钮；返回入口仅属于 `surface: 'page'` 且提供返回回调的主面板，详情页与设置页没有「对话」可返回（`src/client/bundle.js:1209-1226`、`src/client/bundle.js:1317-1320`、`src/client/bundle.js:1364-1366`；渲染条件见 `src/client/bundle.js:919-921`）。
+
+**【确证】** 对应测试已包含四条：main 常注册并声明整页 props（`test/bundle-runtime.test.ts:143-154`）、开关关闭时不占侧栏座位（`test/bundle-runtime.test.ts:156-168`）、开关打开时注册一行并提供 id / label（`test/bundle-runtime.test.ts:170-181`）、无 layout 时不伪造返回按钮（`test/bundle-runtime.test.ts:183-197`）。此处记录测试内容，不代表本次文档修改执行了测试。
 
 ## 6. 最小可用客户端插件骨架
 

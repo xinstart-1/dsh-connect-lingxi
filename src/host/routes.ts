@@ -25,7 +25,12 @@ export const ACTION_PATH = '/plugins/dsh-connect-lingxi/action';
 /** 浏览器能触发的动作白名单。 */
 export type LingxiAction =
   | 'refresh' // 重拉目录/余额/任务，写回缓存
-  | 'login' // 拉起浏览器让用户登录一次，拿到的 cookie 存进配置
+  | 'login' // 拉起浏览器让用户登录一次，拿到的 cookie 存进插件仓库
+  | 'logout' // 忘掉插件仓库里的登录态（不动浏览器 / 客户端自己的登录）
+  | 'switch-account' // 切换当前使用哪个已保存的账号（body: { accountId }）
+  | 'claim-pool-checkin' // 给勾选进池的账号逐个签到
+  | 'test-pool-accounts' // 逐个测勾选的账号是否还能用（一次最小对话）
+  | 'account-balances' // 逐个读**所有**账号的余额（弹层打开时才调，不跟轮询走）
   | 'claim-checkin' // 领每日签到
   | 'claim-one-time' // 把一次性任务做出来并领取
   | 'settings'; // 改插件状态（body 为 Partial<LingxiPluginState> 的子集）
@@ -34,6 +39,11 @@ export type LingxiAction =
 const ACTIONS: readonly LingxiAction[] = [
   'refresh',
   'login',
+  'logout',
+  'switch-account',
+  'claim-pool-checkin',
+  'test-pool-accounts',
+  'account-balances',
   'claim-checkin',
   'claim-one-time',
   'settings',

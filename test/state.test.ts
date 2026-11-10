@@ -13,6 +13,7 @@ import { after, test } from 'node:test';
 import {
   DEFAULT_STATE,
   POLL_INTERVAL_CHOICES,
+  defaultState,
   normalizeState,
   readState,
   statePath,
@@ -53,13 +54,13 @@ test('statePath 跟随 DSH_HOME', () => {
 
 test('文件不存在时读默认值', async () => {
   const env = await tempEnv();
-  assert.deepEqual(await readState(env), { ...DEFAULT_STATE, disabledModels: [] });
+  assert.deepEqual(await readState(env), defaultState());
 });
 
 test('坏 JSON 回落到默认值，不抛', async () => {
   const env = await tempEnv();
   await writeFile(statePath(env), '{ 这不是 JSON', 'utf8');
-  assert.deepEqual(await readState(env), { ...DEFAULT_STATE, disabledModels: [] });
+  assert.deepEqual(await readState(env), defaultState());
 });
 
 test('pollIntervalMs 只认五档，其余回落到默认', async () => {
@@ -90,8 +91,28 @@ test('归一化逐字段回落：一个字段坏掉不牵连其他字段', () =>
 test('normalizeState 对任意坏输入返回默认值', () => {
   for (const bad of [null, undefined, 'garbage', 42, [], true]) {
     assert.doesNotThrow(() => normalizeState(bad));
-    assert.deepEqual(normalizeState(bad), { ...DEFAULT_STATE, disabledModels: [] });
+    assert.deepEqual(normalizeState(bad), defaultState());
   }
+});
+
+test('图片开关两张名单：坏值被丢掉，且冲突时「关」胜出', () => {
+  const state = normalizeState({
+    imageOffModels: ['a', '', 42],
+    imageOnModels: ['a', 'b', null],
+  });
+  assert.deepEqual(state.imageOffModels, ['a']);
+  assert.deepEqual(state.imageOnModels, ['b'], '同一 id 不能既强制开又强制关');
+});
+
+test('defaultState 每次返回独立数组，改一份不污染默认值', () => {
+  const first = defaultState();
+  first.disabledModels.push('x');
+  first.imageOffModels.push('y');
+  first.imageOnModels.push('z');
+  const second = defaultState();
+  assert.deepEqual(second.disabledModels, []);
+  assert.deepEqual(second.imageOffModels, []);
+  assert.deepEqual(second.imageOnModels, []);
 });
 
 test('写入后能读回，且只覆盖给出的字段', async () => {

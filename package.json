@@ -1,8 +1,8 @@
 {
   "name": "dsh-connect-lingxi",
   "displayName": "DSH Connect WPS 灵犀",
-  "description": "把 WPS 灵犀（Lingxi Claw）接入 DeepSeek Harness：原生 tools / tool_calls / reasoning_content 直通，14 个模型（含 DeepSeek V4.1 Flash 1M 上下文）出现在 DSH 模型选择器里；插件设置页显示智点余额、临时积分、每日签到与任务、模型目录与倍率。",
-  "version": "0.0.4",
+  "description": "把 WPS 灵犀（Lingxi Claw）接入 DeepSeek Harness：原生 tools / tool_calls / reasoning_content 直通，与灵犀官网同步的 11 个模型 + 2 个模式（含徽标 NEW / 正式版 / 首发接入）出现在 DSH 模型选择器里，可逐模型勾选启用与图片输入；插件设置页显示智点余额、临时积分、每日签到与任务、模型目录与倍率。",
+  "version": "0.0.15",
   "author": "xinstart-1",
   "license": "MIT",
   "keywords": [

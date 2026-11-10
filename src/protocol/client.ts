@@ -7,7 +7,9 @@
  */
 
 import { randomUUID } from 'node:crypto';
+import { writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
+import { join } from 'node:path';
 import {
   AGENT_CHAT_PATH,
   AGENT_RUNS_PATH,
@@ -20,12 +22,18 @@ import {
   PROFILE_PATH,
   REQUEST_TIMEOUT_MS,
   RUN_TTL_MS,
+  VERSION,
   TASKS_PATH,
 } from '../constants.ts';
 import { fitAgentBody } from './budget.ts';
 import { normalizeModelId, parsePlans, type LingxiModel } from './catalog.ts';
 import { classifyUpstreamError, LingxiError, looksLikeStaleRun } from './errors.ts';
 import { agentHeaders, basicHeaders, normalizeUserCookie } from './headers.ts';
+import {
+  flattenContent,
+  normalizeMessages,
+  normalizeToolChoice,
+} from './normalize.ts';
 
 /** 建会话的响应（只取用得到的字段）。 */
 interface SessionPayload {
@@ -343,18 +351,8 @@ export class LingxiClient {
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const message = messages[i];
       if (message?.role !== 'user') continue;
-      const content = message.content;
-      if (typeof content === 'string') return content.slice(0, 4000);
-      if (Array.isArray(content)) {
-        const text = content
-          .map((part) =>
-            typeof part === 'object' && part !== null && typeof (part as { text?: unknown }).text === 'string'
-              ? ((part as { text: string }).text)
-              : '',
-          )
-          .join('\n');
-        if (text.trim() !== '') return text.slice(0, 4000);
-      }
+      const { text } = flattenContent(message.content);
+      if (text.trim() !== '') return text.slice(0, 4000);
     }
     return '';
   }
@@ -484,6 +482,29 @@ export class LingxiClient {
     return { runId: id.trim(), groupId: groupId.trim() === '' ? id.trim() : groupId.trim() };
   }
 
+  /**
+   * 把被上游拒绝的请求体写到临时目录，供事后定位。
+   *
+   * 只在 4xx 时调用：正常对话不产生文件，也不会拖慢每一轮。正文截到 400 字符，
+   * 避免把整段对话（可能有几十万字）写出去。
+   * @param body - 实际发出去的请求体。
+   * @returns 落盘路径；写失败时返回 `落盘失败`，不影响原有报错。
+   */
+  private async dumpRejectedBody(body: Record<string, unknown>): Promise<string> {
+    const path = join(tmpdir(), 'lingxi-last-chat-body.json');
+    try {
+      const clipped = JSON.parse(
+        JSON.stringify(body, (_key, value) =>
+          typeof value === 'string' && value.length > 400 ? `${value.slice(0, 400)}…` : value,
+        ),
+      ) as unknown;
+      await writeFile(path, JSON.stringify(clipped, null, 2), 'utf8');
+      return `拒绝的请求体: ${path}`;
+    } catch {
+      return '落盘失败';
+    }
+  }
+
   private async send(
     request: ChatRequest,
     cookie: string,
@@ -505,7 +526,16 @@ export class LingxiClient {
       } catch {
         // 保持纯文本。
       }
-      throw classifyUpstreamError(response.status, parsed, '灵犀对话失败');
+      // 把这一份请求体落到临时目录：上游只回一句「参数错误」，不落盘就只能靠猜。
+      // 只在上游拒绝时写，正文截到 400 字符，路径写在错误里方便用户回传给开发者。
+      const dumpPath = await this.dumpRejectedBody(body);
+      // 报错里带上「哪一版插件」与「消息形状」：光看 `参数错误` 分不清是
+      // 旧版没重载（分段 content 直接透传）还是新版漏了某种形状。
+      throw classifyUpstreamError(
+        response.status,
+        parsed,
+        `灵犀对话失败 〔v${VERSION} · ${describeShape(body.messages)} · ${dumpPath}〕`,
+      );
     }
     if (response.body === null) throw new LingxiError('灵犀上游没有返回响应体', 502);
     return response;
@@ -514,11 +544,11 @@ export class LingxiClient {
   /**
    * 为一次性任务建一次「带使用信号」的 run。
    *
-   * 与主对话的 run 有三处差别（缺一处任务就不会被上游计数）：
-   * 1. `client_type` 让上游把这次算成客户端使用（`use_lingxi_client` 任务的判据）；
+   * 与主对话的 run 有三处差别：
+   * 1. `client_type` 声明客户端来源（`use_lingxi_client` 任务的判据）；
    * 2. `session_mode` / `current_mode` 为 `expert` 时才计入专家模式任务；
    * 3. 会话与 run **不缓存**（`fresh: true` 时强制新建）——任务判定要看的是
-   *    「刚刚发生的一次使用」，复用 1 小时前的会话可能已经被算过了。
+   *    最近一次使用，复用 1 小时前的会话可能不满足判据。
    *
    * @param options - 任务对话的参数。
    * @returns `session_id` 与 `group_id`（`execution_status` 上报要用 group_id）。
@@ -577,7 +607,7 @@ export class LingxiClient {
       stream: false,
       model: DEFAULT_MODEL_FOR_TASKS,
       messages: [{ role: 'user', content: options.text }],
-      // 上游按用量扣智点（整数余额）：回答太短可能凑不够 1 智点而不产生计费记录。
+      // 回答过短时上游可能无法确认本次会话产生了有效使用。
       base_llm_arguments: { max_tokens: 4096 },
     };
     const response = await this.request(`${options.base}${AGENT_CHAT_PATH}`, {
@@ -636,22 +666,58 @@ function safeUserName(): string {
  * @param model - 已归一的上游模型 key。
  * @returns 上游请求体（已按预算裁剪）。
  */
+/**
+ * 把 messages 的形状压成一行，用来在报错里认领问题。
+ *
+ * 只写角色与 `content` 的类型/段数，**不写内容** —— 报错信息会显示在界面上，
+ * 也可能被贴到工单里，不该把用户的原话带出去。
+ * @param messages - 实际发出去的 messages（已归一）。
+ * @returns 形如 `system:str,user:array(2),assistant:str`。
+ */
+export function describeShape(messages: unknown): string {
+  if (!Array.isArray(messages)) return 'messages:非数组';
+  const parts = messages.map((message) => {
+    const record = (message ?? {}) as Record<string, unknown>;
+    const role = typeof record.role === 'string' ? record.role : '?';
+    const content = record.content;
+    if (typeof content === 'string') return `${role}:str`;
+    if (Array.isArray(content)) return `${role}:array(${content.length})`;
+    return `${role}:${content === undefined ? 'undefined' : typeof content}`;
+  });
+  return parts.join(',');
+}
+
 export function buildAgentBody(
   request: ChatRequest,
   model: string,
 ): Record<string, unknown> {
-  const messages = [...request.messages];
+  const normalized = normalizeMessages(request.messages);
   const body: Record<string, unknown> = {
     stream: true,
     model,
-    messages,
+    messages: normalized.messages,
   };
 
   if (Array.isArray(request.tools) && request.tools.length > 0) {
     body.tools = request.tools;
-    if (request.toolChoice !== undefined && request.toolChoice !== null) {
-      body.tool_choice = request.toolChoice;
+    const choice = normalizeToolChoice(request.toolChoice);
+    if (choice !== undefined) body.tool_choice = choice;
+    if (
+      choice !== undefined &&
+      request.toolChoice !== undefined &&
+      typeof request.toolChoice === 'object' &&
+      request.toolChoice !== null &&
+      request.onWarn !== undefined
+    ) {
+      request.onWarn(
+        `上游只接受字符串 tool_choice，已把 ${JSON.stringify(request.toolChoice)} 降级为 "${choice}"`,
+      );
     }
+  }
+  if (normalized.droppedParts > 0 && request.onWarn !== undefined) {
+    request.onWarn(
+      `上游不接受分段 content，已丢弃 ${normalized.droppedParts} 段非文本内容（图片等无法透传）`,
+    );
   }
   if (typeof request.temperature === 'number') body.temperature = request.temperature;
 
