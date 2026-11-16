@@ -14,6 +14,7 @@ import { PiAiAdapter, type PiAiAdapterOptions, type ResolvedPiAiProviderProfile 
 import {
   resolveImageAttachmentAccess,
   resolveRetryPolicy,
+  type LlmModelBadge,
   type LlmModelInfo,
   type LlmProviderInfo,
 } from '@deepseek-ai/dsh-llm';
@@ -173,6 +174,11 @@ export function createLingxiAdapter(options: LingxiAdapterOptions): LingxiAdapte
   };
 
   const adapter = new PiAiAdapter(config);
+  // 选择器读的那条路（`llm.listModels`）由 pi-ai 实现，它不知道倍率与徽标；
+  // 在这里包一层补进去，而不是另开一条宿主不读的目录通道。
+  const listModels = adapter.listModels.bind(adapter);
+  adapter.listModels = (provider: string) =>
+    listModels(provider).then((models) => withCatalogDetails(models, options.catalog()));
 
   return {
     adapter,
@@ -196,36 +202,35 @@ export function createLingxiAdapter(options: LingxiAdapterOptions): LingxiAdapte
 /**
  * 把目录条目转成 DSH 的 `LlmModelInfo`（模型发现接口要用）。
  *
- * `badge` 是 DSH 模型选择器里**名字旁边那个小标签**（`LlmModelBadge`）。
- * 官网用它标 `NEW` / `正式版` / `首发接入`，这里原样透传 —— 用户在选择器里
- * 看到的区分，应当与他在官网看到的一致。
+ * `name` 带倍率（`DeepSeek V4.1 Flash · ~0.12x`，见 {@link catalogName}）：
+ * 选择器里那一行只有一个名字字段，倍率不并进去就永远不会出现。
+ * `badge` 是名字旁边那个小标签，官网用它标 `NEW` / `正式版` / `首发接入`，
+ * 这里原样透传 —— 用户在选择器里看到的区分，应当与他在官网看到的一致。
  *
- * `description` 统一成「倍率在前、上游说明在后」：
- * 以前只有上游**没给**说明时才写倍率，于是有的行有倍率、有的行只有一句宣传语，
- * 同一个下拉里两种格式并存 —— 而倍率正是选模型时要比的那个数。现在每行顺序一致，
- * 倍率一定在最前（没有倍率就不写），后面才是上游文案。
+ * 运行时真正给选择器供数的是 {@link withCatalogDetails}（pi-ai 的 `listModels`）；
+ * 这个函数与它保持同一套字段，供单测和还没有 adapter 的调用方使用。
  * @param models - 目录。
  * @returns DSH 侧的模型描述。
  */
 export function toLlmModelInfos(models: readonly LingxiModel[]): LlmModelInfo[] {
-  return models.map((model) => ({
-    provider: PROVIDER,
-    id: model.id,
-    name: model.name,
-    description: modelDescription(model),
-    inputModalities: model.vision ? ['text', 'image'] : ['text'],
-    ...(model.badge === undefined
-      ? {}
-      : { badge: { text: badgeText(model.badge), tone: badgeTone(model.badge) } }),
-  }));
+  return models.map((model) => {
+    const badge = modelBadge(model);
+    return {
+      provider: PROVIDER,
+      id: model.id,
+      name: catalogName(model),
+      description: modelDescription(model),
+      inputModalities: model.vision ? ['text', 'image'] : ['text'],
+      ...(badge === undefined ? {} : { badge }),
+    };
+  });
 }
 
 /**
- * 一行模型在下拉里显示的说明：只有上游文案。
+ * 一行模型在下拉里的第二行说明：只有上游文案。
  *
- * 倍率**不在这里**了：它由客户端的 `conversation.input.model.label` 槽位贴在
- * 模型名后面（`DeepSeek V4.1 Flash · x0.12`），那是选模型时眼睛停留的位置。
- * 两个地方都写一遍，下拉里就会一行两份「倍率」。
+ * 倍率**不在这里**：它已经并进名字（{@link catalogName}）。说明再写一遍，
+ * 同一个下拉里就会一行两份「倍率」。
  *
  * 没有文案就返回 `undefined`，让宿主自己省略这一行，而不是塞空串占位。
  * @param model - 目录条目。
@@ -234,6 +239,66 @@ export function toLlmModelInfos(models: readonly LingxiModel[]): LlmModelInfo[] 
 export function modelDescription(model: LingxiModel): string | undefined {
   const text = model.description;
   return text === undefined || text === '' ? undefined : text;
+}
+
+/**
+ * 选择器里那一行的模型名：`名字 · 倍率`（`DeepSeek V4.1 Flash · ~0.12x`）。
+ *
+ * 倍率必须并进名字字符串：宿主选择器的名字只认 `LlmModelInfo.name`（见
+ * {@link withCatalogDetails} 的说明），没有第二个字段可以挂「倍率」。
+ * 贴的是上游原文 —— `~` 是官网标折扣价的写法，不替它改成确定值。
+ *
+ * 模式（`plan_pro` / `plan_max`）没有倍率，名字保持原样。
+ * @param model - 目录条目。
+ * @returns 选择器里显示的名字。
+ */
+export function catalogName(model: LingxiModel): string {
+  return model.multiplier === '' ? model.name : `${model.name} · ${model.multiplier}`;
+}
+
+/**
+ * 目录徽标 → 宿主徽标；上游没给就是 `undefined`（不凭空造一个）。
+ * @param model - 目录条目。
+ * @returns 宿主可渲染的徽标，或 `undefined`。
+ */
+export function modelBadge(model: LingxiModel): LlmModelBadge | undefined {
+  return model.badge === undefined
+    ? undefined
+    : { text: badgeText(model.badge), tone: badgeTone(model.badge) };
+}
+
+/**
+ * 把目录里的倍率与徽标补进 `listModels` 的结果。
+ *
+ * 宿主选择器的名字与徽标**只从这条路读**：`ctx.llm.listModels(provider)` →
+ * `buildModelCatalog()`（`dsh-api-session-controller`）。pi-ai 的 `listModels`
+ * 只回 `provider/id/name/inputModalities`（它的模型类型里根本没有倍率和徽标），
+ * 所以不补这一步，选择器里就只剩一个干名字 —— 卡片里有倍率、下拉里没有。
+ *
+ * 另一条 `registerModelDiscovery` 是「从接口读模型」的候选清单，宿主会把它
+ * 白名单成 `id/name/contextWindow/maxTokens/inputModalities`，徽标到不了界面，
+ * 所以别把这里当成可有可无的复制。
+ * @param models - `listModels` 原样返回的条目。
+ * @param catalog - 当前目录（可见模型）。
+ * @returns 补上倍率与徽标的条目。
+ */
+export function withCatalogDetails(
+  models: readonly LlmModelInfo[],
+  catalog: readonly LingxiModel[],
+): LlmModelInfo[] {
+  const byId = new Map(catalog.map((model) => [model.id, model]));
+  return models.map((info) => {
+    const entry = byId.get(info.id);
+    if (entry === undefined) return info;
+    const badge = modelBadge(entry);
+    const description = modelDescription(entry);
+    return {
+      ...info,
+      name: catalogName(entry),
+      ...(description === undefined ? {} : { description }),
+      ...(badge === undefined ? {} : { badge }),
+    };
+  });
 }
 
 /**

@@ -437,24 +437,34 @@ testIsolated('模型发现要带官网徽标与说明，否则选择器与卡片
   ) => Promise<
     Array<{
       id: string;
+      name?: string;
       description?: string;
-      badge?: { text: string; tone: string };
+      badge?: { text: string | { en: string; zh: string }; tone: string };
     }>
   >;
   const models = await discover({ provider: PROVIDER });
   const byId = new Map(models.map((model) => [model.id, model]));
 
-  // 官网那三个徽标必须原样出现在模型发现里（这是选择器真正读的路径）。
+  // 官网那三个徽标必须原样出现在模型发现里（设置页「从接口读模型」读这条路径）。
   assert.deepEqual(byId.get('deepseek-v4.1-flash')?.badge, { text: 'NEW', tone: 'info' });
-  assert.deepEqual(byId.get('deepseek-v4-pro-0813')?.badge, { text: '正式版', tone: 'success' });
-  assert.deepEqual(byId.get('GLM-5.3')?.badge, { text: '首发接入', tone: 'info' });
+  assert.deepEqual(byId.get('deepseek-v4-pro-0813')?.badge, {
+    text: { en: 'GA', zh: '正式版' },
+    tone: 'success',
+  });
+  assert.deepEqual(byId.get('GLM-5.3')?.badge, {
+    text: { en: 'Launch', zh: '首发接入' },
+    tone: 'info',
+  });
   // 没有徽标的模型不该带一个空 badge（界面会渲染出一个空胶囊）。
   assert.equal(byId.get('qwen3.8_flash')?.badge, undefined);
 
-  // 模式带官网的说明；普通模型退回「倍率 x」。
+  // 倍率并进名字（选择器与这条发现路径同一套说法），说明只剩上游文案。
+  assert.equal(byId.get('kimi-k3')?.name, 'Kimi-K3 · 1.60x');
+  assert.equal(byId.get('kimi-k3')?.description, undefined, '倍率已在名字里，说明不再重复');
+  // 模式带官网的说明，且没有倍率就不往名字后面拼。
   assert.match(byId.get('plan_pro')?.description ?? '', /日常任务/);
   assert.match(byId.get('plan_max')?.description ?? '', /复杂任务/);
-  assert.match(byId.get('kimi-k3')?.description ?? '', /倍率/);
+  assert.equal(byId.get('plan_pro')?.name, 'Pro 模式');
 
   await disposeAll(disposers);
 });
@@ -575,7 +585,7 @@ testIsolated('shim 真的在回环上监听；卸载后端口释放', async () =
   await new Promise((resolve) => setTimeout(resolve, 150));
 });
 
-testIsolated('有 webServer 时注册 status 与 action 两条路由，卸载后摘掉', async () => {
+testIsolated('有 webServer 时注册 status / action / diag 三条路由，卸载后摘掉', async () => {
   const { ctx, webRoutes, disposers } = fakeContext({ webServer: true });
   await apply(ctx as never, {
     cookie: '',
@@ -591,7 +601,11 @@ testIsolated('有 webServer 时注册 status 与 action 两条路由，卸载后
 
   assert.deepEqual(
     webRoutes.map((route) => route.path).sort(),
-    ['/plugins/dsh-connect-lingxi/action', '/plugins/dsh-connect-lingxi/status'],
+    [
+      '/plugins/dsh-connect-lingxi/action',
+      '/plugins/dsh-connect-lingxi/diag',
+      '/plugins/dsh-connect-lingxi/status',
+    ],
   );
   assert.ok(webRoutes.every((route) => route.kind === 'exact'));
 

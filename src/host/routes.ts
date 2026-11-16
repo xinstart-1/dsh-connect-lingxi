@@ -21,6 +21,8 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 export const STATUS_PATH = '/plugins/dsh-connect-lingxi/status';
 /** 动作路由（同上）。 */
 export const ACTION_PATH = '/plugins/dsh-connect-lingxi/action';
+/** 诊断路由（只读；同样硬编码在浏览器半侧）。 */
+export const DIAG_PATH = '/plugins/dsh-connect-lingxi/diag';
 
 /** 浏览器能触发的动作白名单。 */
 export type LingxiAction =
@@ -33,6 +35,7 @@ export type LingxiAction =
   | 'account-balances' // 逐个读**所有**账号的余额（弹层打开时才调，不跟轮询走）
   | 'claim-checkin' // 领每日签到
   | 'claim-one-time' // 把一次性任务做出来并领取
+  | 'client-report' // 浏览器半侧报一条诊断事件（body: { event, detail, page }）
   | 'settings'; // 改插件状态（body 为 Partial<LingxiPluginState> 的子集）
 
 /** 动作白名单（路由层校验用，与类型同源）。 */
@@ -46,6 +49,7 @@ const ACTIONS: readonly LingxiAction[] = [
   'account-balances',
   'claim-checkin',
   'claim-one-time',
+  'client-report',
   'settings',
 ];
 
@@ -81,6 +85,11 @@ export interface RouteDeps {
   status: () => Promise<unknown>;
   /** 执行动作；返回给浏览器的结果。 */
   action: (action: LingxiAction, body: Record<string, unknown>) => Promise<unknown>;
+  /**
+   * 诊断快照：浏览器半侧上报过的事件 + 宿主侧对「客户端模块到底有没有
+   * 被加载」的观察。只读，不碰上游。
+   */
+  diag: () => unknown;
 }
 
 /**
@@ -176,6 +185,28 @@ export function registerRoutes(ctx: RoutesHost, deps: RouteDeps): void {
             sendJson(res, 200, await deps.status());
           } catch (error) {
             // 只回消息，不回堆栈：这条响应可能被整段贴进 issue。
+            sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
+          }
+        },
+      }),
+    );
+
+    webCtx.effect(() =>
+      webCtx.webServer.register({
+        kind: 'exact',
+        path: DIAG_PATH,
+        handler: async (req, res) => {
+          if (!isLoopbackHost(req.headers.host)) {
+            sendJson(res, 403, { error: 'loopback only' });
+            return;
+          }
+          if (req.method !== 'GET' && req.method !== 'HEAD') {
+            sendJson(res, 405, { error: 'GET only' });
+            return;
+          }
+          try {
+            sendJson(res, 200, deps.diag());
+          } catch (error) {
             sendJson(res, 500, { error: error instanceof Error ? error.message : String(error) });
           }
         },

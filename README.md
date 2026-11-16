@@ -110,7 +110,11 @@ shim 用 `node:http` 监听 `listen(0, "127.0.0.1")`——内核随机分配端�
 WorkBuddy 那样：常驻显示、逐账号勾选、批量签到与测试、每个账号显示余额
 （[`docs/CHANGELOG-0.0.13.md`](docs/CHANGELOG-0.0.13.md)）；0.0.14 把账号+智点读数
 挪到模型选择器前面，并统一了倍率与徽标的显示
-（[`docs/CHANGELOG-0.0.14.md`](docs/CHANGELOG-0.0.14.md)）。
+（[`docs/CHANGELOG-0.0.14.md`](docs/CHANGELOG-0.0.14.md)）；0.0.16 把倍率并进选择器的
+模型名（`DeepSeek V4.1 Flash · ~0.12x`）、徽标改由目录字段渲染，不再占客户端的模型
+标签格子（[`docs/CHANGELOG-0.0.16.md`](docs/CHANGELOG-0.0.16.md)）；0.0.17 给输入框
+胶囊加上诊断上报与 `/diag` 只读路由，读不到投影时不再把胶囊藏起来
+（[`docs/CHANGELOG-0.0.17.md`](docs/CHANGELOG-0.0.17.md)）。
 
 ## 开发
 

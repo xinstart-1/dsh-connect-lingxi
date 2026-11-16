@@ -12,6 +12,7 @@ import { test } from 'node:test';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   ACTION_PATH,
+  DIAG_PATH,
   STATUS_PATH,
   isLoopbackHost,
   registerRoutes,
@@ -95,14 +96,17 @@ function setup(status?: () => Promise<unknown>, action?: (a: LingxiAction, b: Re
         calls.push({ action: a, body: b });
         return { ok: true, action: a };
       }),
+    diag: () => ({ hello: 'diag' }),
   });
   // 执行 effect 才会真正 register。
   for (const effect of fake.effects) effect();
   const statusEntry = fake.entries.find((entry) => entry.path === STATUS_PATH);
   const actionEntry = fake.entries.find((entry) => entry.path === ACTION_PATH);
+  const diagEntry = fake.entries.find((entry) => entry.path === DIAG_PATH);
   assert.ok(statusEntry !== undefined, '状态路由应当注册');
   assert.ok(actionEntry !== undefined, '动作路由应当注册');
-  return { statusEntry, actionEntry, calls };
+  assert.ok(diagEntry !== undefined, '诊断路由应当注册');
+  return { statusEntry, actionEntry, diagEntry, calls };
 }
 
 /** 调一次 handler 并收集响应。 */
@@ -115,7 +119,7 @@ async function call(
   return captured;
 }
 
-test('注册两条路由：status 与 action', () => {
+test('注册三条路由：status / action / diag', () => {
   const { statusEntry, actionEntry } = setup();
   assert.equal(statusEntry.path, '/plugins/dsh-connect-lingxi/status');
   assert.equal(actionEntry.path, '/plugins/dsh-connect-lingxi/action');
@@ -130,6 +134,15 @@ test('非回环 Host 一律 403', async () => {
     assert.match(statusResponse.body, /loopback only/);
     void actionEntry;
   }
+});
+
+test('diag 只收 GET/HEAD，且只给回环 Host', async () => {
+  const { diagEntry } = setup();
+  assert.equal((await call(diagEntry, fakeRequest({ host: '10.0.0.5:61240', method: 'GET' }))).status, 403);
+  assert.equal((await call(diagEntry, fakeRequest({ host: '127.0.0.1:61240', method: 'POST' }))).status, 405);
+  const ok = await call(diagEntry, fakeRequest({ host: '127.0.0.1:61240', method: 'GET' }));
+  assert.equal(ok.status, 200);
+  assert.match(ok.body, /diag/);
 });
 
 test('status 只收 GET/HEAD；action 只收 POST', async () => {
@@ -247,9 +260,10 @@ test('effect 返回的 disposer 能摘掉路由', async () => {
   registerRoutes(ctx, {
     status: async () => ({}),
     action: async () => ({}),
+    diag: () => ({}),
   });
   const disposers = fake.effects.map((effect) => effect());
-  assert.equal(fake.entries.length, 2);
+  assert.equal(fake.entries.length, 3);
   for (const dispose of disposers) dispose();
   assert.equal(fake.entries.length, 0);
 });

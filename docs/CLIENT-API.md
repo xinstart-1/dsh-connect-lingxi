@@ -278,6 +278,14 @@ declaredBy: "an entry in 'conversation.composer.bar' (client-ui-conversation), s
 **【确证】** 目录 `:4035-4092`，`kind: "list"`、`scope: "session"`、owner props `[]`：
 `summary: "Compact controls before the composer submit action; fixed overlays must portal to the document body because the docked composer contains them."`
 
+**本插件的用法（0.0.20 起，与 `dsh-connect-workbuddy` 对齐）**：读数只在这个会话的
+`modelSelection` provider 是 `wps-lingxi` 时显示；新会话还没选模型（provider 未知）
+不显示 —— 「不知道用哪家的模型」不等于「用灵犀」。唯一例外是读投影**抛异常**
+（宿主接口变了）：上报 `gate-error` 后照常显示，避免历史 bug「重启后胶囊消失」回归。
+
+皮肤也照 WorkBuddy：纯文字、无边框无底色、悬停浮浅底、`12px/18px`、数字等宽
+（`.dsm-lingxi-pill-trigger`）；文案是 `WPS灵犀 · 3,100`，单位（智点）放在 tooltip 与弹层里。
+
 #### `conversation.input.model.label`
 
 **【确证】** 目录 `:3856-3894`：
@@ -307,7 +315,40 @@ declaredBy: "an entry in 'conversation.input.model' (client-ui-model-selection),
 
 **【确证】** 该插件结论：**注册 `conversation.input.model.label` 必须显式给负 priority**（如 `priority: -1`）以 shadow 官方条目。目录里 `replaceRisk: "shadows-shipped-ui"` 也印证。
 
-**本插件的取舍（0.0.15 起）**：本插件也占这个格子（`priority: -105`），用来把倍率与徽标画在模型名后面（`DeepSeek V4.1 Flash · x0.11` + 徽标）。占住的代价必须讲清楚：宿主自己的官方徽标只在**格子没有占位者**时由宿主画，所以本插件的 `ModelLabel` 对**别人的 provider 行**返回「名字 + 它自己的 `model.badge`」，把它原本要画的东西还回去 —— 只损失样式，不丢信息。`keyed` 宿主上每家 provider 各占一格，退化为按 `provider.id` 注册，那时不存在这个代价。
+**本插件的取舍（0.0.16 起）**：**不再注册这个槽位**。
+
+- 0.0.15 曾用 `priority: -105` 占住格子画「倍率 + 徽标」，代价是挤掉别的插件在同一格里的
+  注册（`single` = 一个格子，谁注册谁独占），并且盖住宿主自己的默认标签。
+- 0.0.16 查清了选择器的数据来源：**名字与徽标只从 `ctx.llm.listModels()` 读**
+  （宿主 `buildModelCatalog()`，在 `dsh-api-session-controller`）。pi-ai 的
+  `listModels` 只回 `provider/id/name/inputModalities`，倍率与徽标没有字段可挂 ——
+  所以把倍率**并进名字字符串**（`DeepSeek V4.1 Flash · ~0.12x`）、把徽标补进
+  `LlmModelInfo.badge`，由宿主自己的渲染（或占了格子的别的插件）画出来。
+- 触发器（`placement: 'trigger'`）里宿主把徽标排**在名字前**，下拉菜单里却是**名字后**。
+  客户端只注入一条视觉顺序样式，把本插件模型行统一成「名字 徽标」：
+  `[class*="triggerLabel"] [data-provider-id="wps-lingxi"] [class*="badgedNameText"]{order:-1}`。
+  它不改变元素、不改变语义；宿主改写类名后缀时静默失效，触发器退回宿主默认顺序。
+- **徽标由插件自绘**（0.0.19 起）：DSH 0.2.2 起选择器不再渲染目录徽标（catalog 里
+  `badge` 还在，界面不画），所以客户端先藏掉宿主那张 Tag，再按 `/status` 的
+  `models[].badge` 自己生成胶囊：
+
+  - 藏宿主：`[data-provider-id="wps-lingxi"] [class*="badge"]:not([class*="badgedName"]){display:none}`
+    （`:not` 避开「名字+徽标」包裹层，它的类名里也含 `badge`）；
+  - 画自己的：`[data-provider-id="wps-lingxi"][data-model-id="<id>"]::after{content:"NEW";…}`，
+    浅橙底 `#fef1ea`、橙字 `#e2651a`、全圆角胶囊（照灵犀网页截图取值）；
+  - `/status` 每次轮询回来都重建这份样式（`applyModelBadges`），模型增删自动跟上；
+  - 以后宿主恢复渲染也不会出现两份——宿主的已经被藏掉。
+- 反过来说：`registerModelDiscovery` 的回调建筑的是「从接口读模型」的候选清单，
+  宿主会把返回字段白名单成 `id/name/contextWindow/maxTokens/inputModalities`，
+  徽标到不了界面 —— 别再把它当选择器通道。
+
+### 相关：模型目录只有一条路
+
+模型选择器（下拉 + 输入框触发器）显示的 `name` / `description` / `badge` 全部来自
+宿主 `buildModelCatalog()` → `ctx.llm.listModels(provider)`（`llm` 服务对 adapter 返回
+字段做白名单校验）。要让界面看见目录里的信息，只能从这条路送：要么改 pi-ai adapter 的
+`listModels` 输出（本插件用 `withCatalogDetails` 包了一层），要么改 adapter 里的
+`Model.name`。
 
 #### `plugins.bundle.config`
 

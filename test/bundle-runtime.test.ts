@@ -275,70 +275,129 @@ test('登录期读不到账号时读数只报余额，不编账号名', async ()
   }
 });
 
-/**
- * 把一个渲染结果里的文本全部拼起来（假 React 的元素只是 `{type, props}`）。
- *
- * 假 React 不会替我们展开函数组件，所以遇到 `type` 是函数就地调用一次 ——
- * 组件套组件的情况（外层 Gate → 内层 Pill → 若干 span）都能读到文字。
- */
-function collectText(node: unknown): string {
-  if (node === undefined || node === null) return '';
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(collectText).join('');
-  const element = node as { type?: unknown; props?: { children?: unknown } };
-  if (element.props === undefined) return '';
-  if (typeof element.type === 'function') {
-    return collectText((element.type as (props: unknown) => unknown)(element.props));
-  }
-  return collectText(element.props.children);
-}
-
-test('模型标签把倍率和徽标画在名字后面，别人的模型行原样还回去', async () => {
-  const doc = statusDoc(false) as { models: unknown[] };
-  doc.models = [
-    { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', multiplier: '0.11', contextWindow: 0, maxTokens: 0, reasoning: false },
-  ];
-  const harness = boot([doc]);
+test('新会话没选模型时输入框不显示读数（与 WorkBuddy 同一条规则）', () => {
+  const harness = boot([statusDoc(false)]);
   try {
-    await settle();
-    const label = harness.registrations.find(
-      (entry) => entry.name === 'conversation.input.model.label',
-    );
-    assert.ok(label !== undefined, '模型标签槽位没注册');
-    // 负优先级：`single` 槽位同优先级会抛，宿主自己在 0 注册了官方徽标。
-    assert.equal(
-      (label as unknown as { priority?: number }).priority,
-      -105,
-      '必须用负优先级盖住宿主的默认标签',
-    );
-    const render = label.component as (props: unknown) => unknown;
-
-    // 别的 provider：名字要照旧，否则占住唯一的格子就等于把它的名字抹掉。
-    const foreign = collectText(
-      render({
-        t: (key: string) => key,
-        provider: { id: 'deepseek' },
-        model: { id: 'deepseek-chat', name: 'DeepSeek Chat' },
-      }),
-    );
-    assert.match(foreign, /DeepSeek Chat/, '别人的模型名必须原样出现');
-
-    // 本插件的模型：名字 + `· x倍率` + 徽标。
-    const mine = collectText(
-      render({
-        t: (key: string) => key,
-        provider: { id: 'wps-lingxi' },
-        model: {
-          id: 'deepseek-v4.1-flash',
-          name: 'DeepSeek V4.1 Flash',
-          badge: { text: 'NEW', tone: 'info' },
-        },
-      }),
-    );
-    assert.match(mine, /DeepSeek V4\.1 Flash/);
-    assert.match(mine, /x0\.11/, '倍率要贴在名字后面');
-    assert.match(mine, /NEW/, '徽标要画出来');
+    const gate = harness.registrations.find((entry) => entry.name === 'conversation.input.right');
+    assert.ok(gate !== undefined, '读数没注册');
+    const component = gate.component as (props: unknown) => unknown;
+    const t = (key: string, params?: Record<string, string>) =>
+      params === undefined ? key : key + '(' + Object.values(params).join('|') + ')';
+    // 新会话：投影里 next / lastUsed 都是 null —— 不知道用哪个 provider，不显示。
+    assert.equal(component({ t, useProjection: () => ({ next: null, lastUsed: null }) }), null);
+    // 投影压根没有：同样不显示。
+    assert.equal(component({ t, useProjection: () => undefined }), null);
+    // 选了别人的模型：不显示灵犀余额。
+    assert.equal(component({ t, useProjection: () => ({ next: { provider: 'raccoon' } }) }), null);
+    // 读投影抛异常也不显示。这条以前是反过来的（「读不到就照旧显示，免得胶囊消失」），
+    // 实测后果更糟：新会话根本没有 `modelSelection` 投影，几家连接器插件于是同时
+    // 在同一个输入框里画余额（果办 / WPS灵犀 / 小浣熊），堆成一排。
+    const shown = component({
+      t,
+      useProjection: () => {
+        throw new Error('projection renamed');
+      },
+    });
+    assert.equal(shown, null, '读不到投影就不画：不知道用哪家，画出来就是抢别人的位置');
   } finally {
     harness.disposeAll();
+  }
+});
+
+test('读数用 WorkBuddy 那种纯文字皮肤：无边框无底色，悬停才浮底', () => {
+  // 胶囊的皮肤在注入的 CSS 里，不在内联样式里 —— 内联样式写不了 :hover。
+  assert.match(source, /\.dsm-lingxi-pill-trigger\{/, '缺少读数皮肤类');
+  assert.match(source, /\.dsm-lingxi-pill-trigger:hover\{/, '缺少悬停反馈');
+  assert.match(source, /font-variant-numeric:tabular-nums/, '数字要等宽，余额跳动时不抖');
+  assert.match(source, /border:0/, '不是带边框的 chip');
+  assert.match(source, /font-size:12px;line-height:18px/, '与 WorkBuddy 一致的 12/18');
+  // 文案也照它的形状：产品名 + 数字，不在胶囊上堆「智点」。
+  assert.match(source, /pillAccount: 'WPS灵犀 · \{total\}',/);
+  assert.match(source, /pillAccount: 'WPS Lingxi · \{total\}',/);
+});
+
+test('不去占模型名旁边的标签格子（倍率与徽标改由目录数据带到界面）', async () => {
+  // 0.0.15 曾在这里注册 `conversation.input.model.label`。那个槽位在宿主上是
+  // `single` —— 一个格子，谁注册谁独占：盖住宿主的默认标签，也会挤掉别的
+  // 插件（比如给自家行画促销徽标的插件）的同一格。0.0.16 起倍率并进模型名、
+  // 徽标走 `llm.listModels` 的目录字段，宿主自己的渲染就能画出来，不需要占格子。
+  const harness = boot([statusDoc(false)]);
+  try {
+    await settle();
+    assert.equal(
+      harness.registrations.some((entry) => entry.name === 'conversation.input.model.label'),
+      false,
+      '别再注册模型标签槽位：那是别人的格子',
+    );
+  } finally {
+    harness.disposeAll();
+  }
+});
+
+test('触发器里徽标排在名字后面：只注入顺序样式，不重占标签格子', () => {
+  // 宿主在触发器里的默认排法是「徽标 名字」（`ModelSelect` 的 `renderModelLabel`
+  // 对 trigger 把徽标放在名字前），下拉菜单里却是「名字 徽标」。用一条只改视觉
+  // 顺序的样式把触发器也对齐，而不是为此去抢 `single` 槽位。
+  const styles: Array<{ dataset: Record<string, string>; textContent: string }> = [];
+  const g = globalThis as unknown as Record<string, unknown>;
+  const previousDocument = g.document;
+  g.document = {
+    head: {
+      appendChild: (node: unknown) => {
+        styles.push(node as { dataset: Record<string, string>; textContent: string });
+      },
+    },
+    querySelector: () => null,
+    createElement: () => ({ dataset: {}, textContent: '' }),
+  };
+  try {
+    const harness = boot([statusDoc(false)]);
+    harness.disposeAll();
+    const order = styles.find((style) =>
+      String(style.dataset.pluginCss ?? '').endsWith('model-label-order.css'),
+    );
+    assert.ok(order !== undefined, '没有注入模型标签顺序样式');
+    assert.match(String(order.textContent), /triggerLabel/, '只作用在触发器');
+    assert.match(String(order.textContent), /\[data-provider-id="wps-lingxi"\]/, '只作用在本插件的模型行');
+    assert.match(String(order.textContent), /order:-1/, '把名字提到徽标前面');
+  } finally {
+    g.document = previousDocument;
+  }
+});
+
+test('目录徽标配色照灵犀网页：浅橙底橙字胶囊，只作用在本插件模型行', () => {
+  const styles: Array<{ dataset: Record<string, string>; textContent: string }> = [];
+  const g = globalThis as unknown as Record<string, unknown>;
+  const previousDocument = g.document;
+  g.document = {
+    head: {
+      appendChild: (node: unknown) => {
+        styles.push(node as { dataset: Record<string, string>; textContent: string });
+      },
+    },
+    querySelector: () => null,
+    createElement: () => ({ dataset: {}, textContent: '' }),
+  };
+  try {
+    const harness = boot([statusDoc(false)]);
+    harness.disposeAll();
+    const badge = styles.find((style) =>
+      String(style.dataset.pluginCss ?? '').endsWith('model-badge.css'),
+    );
+    assert.ok(badge !== undefined, '没有注入模型徽标配色样式');
+    const css = String(badge.textContent);
+    // apply 先落一份底：把宿主那张 Tag 藏掉（以后宿主恢复渲染也不会出现双份），
+    // 范围只在本插件的模型行。
+    assert.match(css, /display:none/, '宿主的 Tag 要藏起来');
+    assert.match(css, /\[data-provider-id="wps-lingxi"\]/, '只作用在本插件的模型行');
+    // 每个模型的胶囊由 `/status` 回来后的 `applyModelBadges` 生成。
+    assert.match(source, /function applyModelBadges\(/, '缺少徽标样式生成函数');
+    assert.match(source, /applyModelBadges\(document\.models\)/, '状态回来时没有重建徽标样式');
+    assert.match(source, /\[data-provider-id="wps-lingxi"\]\[data-model-id="/, '按模型 id 定位');
+    assert.match(source, /::after/, '用伪元素画胶囊');
+    assert.match(source, /#fef1ea/, '浅橙底取自灵犀网页截图的填充色');
+    assert.match(source, /#e2651a/, '橙字取自灵犀网页截图的文字色');
+  } finally {
+    g.document = previousDocument;
   }
 });

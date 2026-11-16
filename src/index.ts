@@ -27,12 +27,14 @@ import {
   type StoredCredential,
 } from './credentials/vault.ts';
 import { registerRoutes } from './host/routes.ts';
+import { snapshotClientModules, type ClientModulesLike } from './host/client-diag.ts';
 import { LingxiRuntime } from './host/runtime.ts';
 import type { StatusAccount, StatusAccountPool } from './host/status.ts';
 import { visibleModels } from './host/model-flags.ts';
 import {
-  badgeTone,
+  catalogName,
   createLingxiAdapter,
+  modelBadge,
   type AttachmentStore,
   type LingxiAdapter,
 } from './llm/adapter.ts';
@@ -472,10 +474,15 @@ export async function apply(ctx: Context, rawConfig: LingxiConfig): Promise<void
   };
 
   // 1. 运行时（先建，后面 refreshCatalog 与路由都指向它）。
+  //    客户端模块表的观察入口要等 `ctx.inject(['clientModules'])` 回调，
+  //    所以先用一个可替换的持有者，运行时在 `/diag` 里现取。
+  let describeClientModules: (() => unknown) | undefined;
   const runtime = new LingxiRuntime({
     client,
     version: VERSION,
     warn,
+    clientModules: () =>
+      describeClientModules === undefined ? undefined : describeClientModules(),
     state: async () => pluginState,
     saveState,
     credential: resolveCookie,
@@ -556,34 +563,41 @@ export async function apply(ctx: Context, rawConfig: LingxiConfig): Promise<void
     const models =
       resolved.value === '' ? [] : await client.listModels(resolved.value, signal);
     const source = models.length === 0 ? visibleCatalog(catalog) : dedupeModels(visibleCatalog(models));
-    // 这里是**模型选择器真正读的那条路**：少了 badge/description，官网上那些
-    // `NEW` / `正式版` / `首发接入` 与模式说明就不会出现在选择器里 —— 而它们在
-    // `/status` 与卡片里都有，于是同一个模型在两个界面长得不一样。
-    return source.map((model) => ({
-      id: model.id,
-      name: model.name,
-      contextWindow: model.contextWindow,
-      maxTokens: model.maxTokens,
-      inputModalities: model.vision ? (['text', 'image'] as const) : (['text'] as const),
-      ...(model.description === undefined
-        ? model.multiplier === ''
-          ? {}
-          : { description: `倍率 ${model.multiplier}` }
-        : { description: model.description }),
-      ...(model.badge === undefined
-        ? {}
-        : { badge: { text: model.badge, tone: badgeTone(model.badge) } }),
-    }));
+    // 这条发现回调服务的是「从接口读模型」的候选清单（设置页里选模型来采用），
+    // **不是**模型选择器：选择器读的是 `ctx.llm.listModels()` → `buildModelCatalog()`，
+    // 也就是 adapter 的 `listModels`（见 `withCatalogDetails`）。这里给宿主的字段
+    // 也会被它白名单成 `id/name/contextWindow/maxTokens/inputModalities`，
+    // 徽标与说明到不了界面 —— 所以名字同样并进倍率，两个入口的说法才一致。
+    return source.map((model) => {
+      const badge = modelBadge(model);
+      return {
+        id: model.id,
+        name: catalogName(model),
+        contextWindow: model.contextWindow,
+        maxTokens: model.maxTokens,
+        inputModalities: model.vision ? (['text', 'image'] as const) : (['text'] as const),
+        ...(model.description === undefined ? {} : { description: model.description }),
+        ...(badge === undefined ? {} : { badge }),
+      };
+    });
   });
 
-  // 4. 卡片/胶囊用的两条宿主路由（cookie 不进页面，页面只拿归一好的展示数据）。
+  // 4. 卡片/胶囊用的宿主路由（cookie 不进页面，页面只拿归一好的展示数据）。
   registerRoutes(
     ctx as unknown as Parameters<typeof registerRoutes>[0],
     {
       status: () => runtime.status(false),
       action: (action, body) => runtime.run(action, body),
+      diag: () => runtime.diag(),
     },
   );
+
+  // 4.1 客户端模块表的观察入口：`clientModules` 是 Web 宿主才有的服务，
+  //     纯 CLI 组合里没有，所以用 `inject`（可选依赖）而不是硬取。
+  ctx.inject(['clientModules'], (modulesCtx) => {
+    const service = (modulesCtx as unknown as { clientModules: ClientModulesLike }).clientModules;
+    describeClientModules = () => snapshotClientModules(service);
+  });
 
   // 5. 生命周期：卸载时释放注册、路由与端口。disposer 是异步的——必须等
   //    `shim.close()` 真的完成，否则进程会因为有监听句柄而不退出。

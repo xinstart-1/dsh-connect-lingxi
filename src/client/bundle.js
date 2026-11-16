@@ -24,6 +24,18 @@
   var PANEL_ID = 'dsh-connect-lingxi';
   var STATUS_PATH = '/plugins/dsh-connect-lingxi/status';
   var ACTION_PATH = '/plugins/dsh-connect-lingxi/action';
+  /**
+   * 客户端事件上报（诊断用，只走 POST 一个动作，不占状态轮询）。
+   *
+   * 为什么要它：浏览器半侧跑在宿主渲染器里，它「没画出来」时，我们这边的
+   * 控制台是看不到的 —— 槽位没声明、回调抛异常、门控把胶囊挡了，三种原因
+   * 在界面上都是同一个「什么都没有」。让客户端把自己的判断报回宿主，
+   * 诊断页才说得清发生过什么。
+   */
+  var REPORT_PATH = ACTION_PATH + '?action=client-report';
+  /** 最近一次门控结论：诊断页用它解释「胶囊为什么不在」。 */
+  var lastGate;
+
   /** 轮询间隔：宿主那边真正的刷新节奏由它自己的 pollIntervalMs 决定，这里只决定界面多久问一次。 */
   var POLL_INTERVAL_MS = 60000;
 
@@ -49,8 +61,95 @@
     // 行样式是内联的（保留了原有实现），所以这里必须用 !important 才盖得住。
     '.dsm-lingxi-card>:last-child{border-bottom:0 !important}',
     '.dsm-lingxi-card>div,.dsm-lingxi-card li{flex-wrap:wrap}',
-    '.dsm-lingxi-card input,.dsm-lingxi-card select,.dsm-lingxi-card button{max-width:100%}'
+    '.dsm-lingxi-card input,.dsm-lingxi-card select,.dsm-lingxi-card button{max-width:100%}',
+    // 输入框左侧的智点读数：照 WorkBuddy 的写法——纯文字，无边框无底色，
+    // 悬停才浮出一块浅底；12px/18px、弱化色、数字等宽。读数是次要信息，
+    // 不该和旁边的权限/模型控件抢注意力。高度与整行对齐交给
+    // `align-self:stretch`，不写死固定高度（写死会在窄窗口里把行撑变形）。
+    '.dsm-lingxi-pill-trigger{appearance:none;align-self:stretch;display:inline-flex;align-items:center;background:transparent;border:0;border-radius:6px;color:var(--dsw-alias-label-tertiary,#999);cursor:pointer;font:inherit;font-size:12px;line-height:18px;font-variant-numeric:tabular-nums;padding:2px 6px;white-space:nowrap}',
+    '.dsm-lingxi-pill-trigger:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(127,127,127,.14))}',
+    '.dsm-lingxi-pill-trigger:focus-visible{outline:2px solid var(--dsw-alias-brand-primary,#5686fe);outline-offset:1px}'
   ].join('\n');
+
+  // 触发器（输入框左侧）里宿主的默认排法是「徽标 名字」，下拉菜单里却是
+  // 「名字 徽标」。本插件的行统一成「名字 徽标」——名字是眼睛先找的，徽标是
+  // 修饰；同一个模型在两处的顺序不一样，读起来像两个东西。
+  //
+  // 不为此重占 `conversation.input.model.label` 槽位：那个格子是 `single`，
+  // 重占会挤掉别的插件（0.0.15 就这么失败过，见 0.0.16 变更说明）。这里只把
+  // 宿主自己画的那一行里的**文字**提前，元素不变、语义不变，最坏情况是宿主
+  // 改写类名后这段规则失效、退回默认顺序，不会报错。
+  // 选择器锚在 CSS Module 类名的后缀上（宿主会加哈希前缀），并且只作用于
+  // 本插件的 provider，别人的模型行不受影响。
+  var MODEL_LABEL_ORDER_CSS = [
+    '[class*="triggerLabel"] [data-provider-id="wps-lingxi"] [class*="badgedNameText"]{order:-1}'
+  ].join('\n');
+
+  // 目录徽标（NEW / 正式版 / 首发接入）：宿主那张 Tag 先藏起来，改由本插件
+  // 按灵犀网页的样式自己画——浅橙底 + 橙字胶囊。
+  //
+  // 为什么自己画：DSH 0.2.2 起选择器不再把目录徽标画出来（catalog 里 badge 还在，
+  // 界面上没了）；自己画还顺手解决了「以后宿主恢复渲染会出现两份」的问题——
+  // 宿主的先 `display:none`，只剩我们这一份。规则按 `data-model-id` 定位。
+  var MODEL_BADGE_BASE_CSS = [
+    '[data-provider-id="wps-lingxi"] [class*="badge"]:not([class*="badgedName"]){display:none !important}'
+  ].join('\n');
+
+  /** 徽标文案 → CSS content 值（转义反斜杠、双引号与换行）。 */
+  function badgeContent(text) {
+    var escaped = String(text)
+      .replace(/\\/g, '\\\\')
+      .replace(/"/g, '\\"')
+      .replace(/[\r\n]/g, ' ');
+    return '"' + escaped + '"';
+  }
+
+  /**
+   * 按当前目录生成徽标样式：每个带徽标的模型一条规则，在模型名容器
+   * （`data-model-id` 始终存在）后面补一个胶囊。
+   * @param models - `/status` 里的模型数组。
+   * @returns 完整的样式文本。
+   */
+  function modelBadgeCss(models) {
+    var rules = [MODEL_BADGE_BASE_CSS];
+    if (Array.isArray(models)) {
+      models.forEach(function (model) {
+        if (model === null || typeof model !== 'object') return;
+        if (typeof model.id !== 'string' || model.id === '') return;
+        if (typeof model.badge !== 'string' || model.badge === '') return;
+        var id = model.id.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        rules.push(
+          '[data-provider-id="wps-lingxi"][data-model-id="' + id + '"]::after{' +
+            'content:' + badgeContent(model.badge) + ';' +
+            'margin-left:6px;padding:0 7px;border-radius:999px;' +
+            'background:#fef1ea;color:#e2651a;' +
+            'font-size:10px;line-height:18px;font-weight:400;' +
+            'white-space:nowrap;vertical-align:middle' +
+            '}'
+        );
+      });
+    }
+    return rules.join('\n');
+  }
+
+  /** 把徽标样式写进 `<head>`（不存在就建；DOM 不可用时静默跳过）。 */
+  function applyModelBadges(models) {
+    try {
+      if (typeof document === 'undefined' || document === null) return;
+      var cssId = 'dsh-connect-lingxi/model-badge.css';
+      var css = modelBadgeCss(models);
+      var existing = document.querySelector('style[data-plugin-css="' + cssId + '"]');
+      if (existing !== null) existing.textContent = css;
+      else {
+        var styleTag = document.createElement('style');
+        styleTag.dataset.pluginCss = cssId;
+        styleTag.textContent = css;
+        document.head.appendChild(styleTag);
+      }
+    } catch (error) {
+      // 样式只是外观：失败不影响任何功能。
+    }
+  }
 
   var zh = {
     tabAccount: '账号',
@@ -67,11 +166,11 @@
       '把 WPS 灵犀接入 DSH：原生工具调用与思考通道直通，这里管理智点余额、签到与模型目录。',
     name: 'WPS 灵犀',
     pill: '灵犀',
-    pillCredits: '灵犀 · {total}',
-    pillUnknown: '灵犀 · —',
-    pillAccount: 'WPS灵犀 · {total} 智点',
-    pillAccountUnknown: 'WPS灵犀 · — 智点',
-    pillAccountHint: '灵犀 · 当前账号 {account}（点开看各账号余额与签到）',
+    pillCredits: 'WPS灵犀 · {total}',
+    pillUnknown: 'WPS灵犀 · —',
+    pillAccount: 'WPS灵犀 · {total}',
+    pillAccountUnknown: 'WPS灵犀 · —',
+    pillAccountHint: '灵犀 · 当前账号 {account}（点开看各账号智点余额与签到）',
     pillPanelTitle: '灵犀 积分',
     pillRefresh: '刷新',
     pillRefreshHint: '重新读一次各账号余额',
@@ -124,6 +223,9 @@
     diagAccount: '账号',
     diagError: '上游最近一次错误',
     diagNone: '无',
+    diagPill: '输入框胶囊',
+    diagPillShown: '显示中',
+    diagPillHidden: '已隐藏（当前 provider 不是灵犀的模型）',
     loginSignedIn: '已登录',
     loginSignedOut: '未登录',
     loginExpired: '登录态已失效',
@@ -178,10 +280,10 @@
       'WPS Lingxi as a DSH model provider: native tool calls and reasoning passthrough, with credits, check-in and the model catalog managed here.',
     name: 'WPS Lingxi',
     pill: 'Lingxi',
-    pillCredits: 'Lingxi · {total}',
-    pillUnknown: 'Lingxi · —',
-    pillAccount: 'WPS Lingxi · {total} credits',
-    pillAccountUnknown: 'WPS Lingxi · — credits',
+    pillCredits: 'WPS Lingxi · {total}',
+    pillUnknown: 'WPS Lingxi · —',
+    pillAccount: 'WPS Lingxi · {total}',
+    pillAccountUnknown: 'WPS Lingxi · —',
     pillAccountHint: 'Lingxi · current account {account} (click for per-account balances)',
     pillPanelTitle: 'Lingxi credits',
     pillRefresh: 'Refresh',
@@ -235,6 +337,9 @@
     diagAccount: 'Account',
     diagError: 'Last upstream error',
     diagNone: 'None',
+    diagPill: 'Composer pill',
+    diagPillShown: 'showing',
+    diagPillHidden: 'hidden (current provider is not a WPS Lingxi model)',
     loginSignedIn: 'Signed in',
     loginSignedOut: 'Signed out',
     loginExpired: 'Sign-in expired',
@@ -283,6 +388,11 @@
     factory: function factory(require) {
       var React = require('react');
       var h = React.createElement;
+
+      // 第一件事就是上报「模块真的被宿主的模块表执行了」。诊断页据此把
+      // 「插件没加载」和「加载了但没画出来」分开——这两种情况在界面上都是
+      // 一个空的输入框，只有这一条能把它们区分开。
+      report('module', BUNDLE_NAME + ' factory entered');
 
       /** 数字格式化：拿不到就显示破折号，绝不显示 `NaN`。 */
       function credits(value) {
@@ -387,6 +497,7 @@
           .then(function (document) {
             if (document === undefined) return;
             snapshot = document;
+            applyModelBadges(document.models);
             listeners.forEach(function (listener) {
               listener(snapshot);
             });
@@ -432,6 +543,44 @@
       }
 
       /** 发一个动作并立刻重读状态（不乐观更新：界面显示上游的真读数）。 */
+      /** 已上报过的事件时刻（同一事件 60 秒内只报一次，避免轮询把日志刷满）。 */
+      var reportedAt = {};
+      /**
+       * 把一条客户端事件报给宿主。
+       *
+       * 三条纪律：只发字符串（不传对象、不传 React 节点）、失败就丢、
+       * 自己绝不抛 —— 诊断通道成为新的故障源，比没有诊断更糟。
+       * @param event - 事件名（如 `pill-gate`）。
+       * @param detail - 一句话细节（截断到 300 字符）。
+       */
+      function report(event, detail) {
+        try {
+          if (typeof fetch !== 'function') return;
+          // 这个函数会在 `var reportedAt = {}` 执行之前就被调用（模块入口那一条），
+          // 所以不能假设它已经初始化。
+          if (reportedAt === undefined) reportedAt = {};
+          var text = detail === undefined || detail === null ? '' : String(detail);
+          var key = String(event) + '|' + text.slice(0, 60);
+          var now = Date.now();
+          if (reportedAt[key] !== undefined && now - reportedAt[key] < 60000) return;
+          reportedAt[key] = now;
+          var page = typeof location === 'undefined' ? '' : String(location.pathname + location.search);
+          void fetch(REPORT_PATH, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              event: String(event).slice(0, 80),
+              detail: text.slice(0, 300),
+              page: page.slice(0, 120),
+              atMs: now,
+            }),
+            keepalive: true,
+          }).catch(function () {});
+        } catch (error) {
+          /* 静默：诊断自己不能成为故障源。 */
+        }
+      }
+
       function act(action, body) {
         return fetch(ACTION_PATH + '?action=' + encodeURIComponent(action), {
           method: 'POST',
@@ -539,14 +688,14 @@
         },
         /** 模型名 + 徽标排成一行；徽标紧跟名字，不参与右对齐。 */
         modelNameRow: { display: 'flex', alignItems: 'center', gap: '6px', flexWrap: 'wrap', minWidth: 0 },
-        /** 官网徽标：橙边框小圆角，与官网截图同一形状（不抢名字的字重）。 */
+        /** 官网徽标：浅橙底橙字胶囊，与灵犀网页截图一致（不抢名字的字重）。 */
         badge: {
           fontSize: '10px',
-          lineHeight: '15px',
-          padding: '0 6px',
+          lineHeight: '18px',
+          padding: '0 7px',
           borderRadius: '999px',
-          border: '1px solid var(--dsw-warning, #d0a215)',
-          color: 'var(--dsw-warning, #d0a215)',
+          background: '#fef1ea',
+          color: '#e2651a',
           whiteSpace: 'nowrap',
         },
         rowValue: { fontSize: '12px', color: textSecondary, textAlign: 'right', minWidth: 0, overflowWrap: 'anywhere' },
@@ -1044,6 +1193,18 @@
           h('div', { style: css.groupLine }, h('span', { style: css.rowLabel }, t('diagLogin')), h('span', { style: css.rowValue }, loginLabel)),
           h('div', { style: css.groupLine }, h('span', { style: css.rowLabel }, t('diagSource')), h('span', { style: css.rowValue }, sourceLabel)),
           login.name === undefined ? null : h('div', { style: css.groupLine }, h('span', { style: css.rowLabel }, t('diagAccount')), h('span', { style: css.rowValue }, login.name)),
+          h(
+            'div',
+            { style: css.groupLine },
+            h('span', { style: css.rowLabel }, t('diagPill')),
+            h(
+              'span',
+              { style: css.rowValue },
+              lastGate === undefined
+                ? t('diagNone')
+                : String(lastGate.provider) + ' · ' + t(lastGate.provider === PROVIDER_ID ? 'diagPillShown' : 'diagPillHidden'),
+            ),
+          ),
           h(
             'div',
             { style: css.groupLine },
@@ -1645,6 +1806,11 @@
         // 当前账号：读数要回答「这个模型由哪个账号出账」，所以账号和余额一样重要。
         // 取 `current` 而不是 `selected` —— 用户点选的与真在用的可能不是一个。
         var account = currentAccountName(status);
+        // 「门控过了、组件真的挂上了」——与 `gate` 那条合起来看，就能区分
+        // 「门控挡了」和「渲染崩了」。
+        React.useEffect(function () {
+          report('pill-mounted', 'total=' + String(total));
+        }, []);
         // 胶囊只回答「这条消息花的是哪家、还剩多少」，账号名留给 tooltip 和
         // 弹层里的账号表 —— 一行里塞「账号 · 余额」，小字号下挤成一片，
         // 而且同一串 `895****935` 在弹层标题下又出现一次。
@@ -1687,20 +1853,9 @@
                 account === undefined
                   ? t('name')
                   : t('pillAccountHint', { account: maskAccount(account) }),
-              style: {
-                appearance: 'none',
-                background: 'transparent',
-                border: '1px solid var(--dsh-composer-dock-inset, currentColor)',
-                borderRadius: '999px',
-                color: 'inherit',
-                cursor: 'pointer',
-                font: 'inherit',
-                fontSize: '12px',
-                lineHeight: 1.4,
-                opacity: 0.8,
-                padding: '1px 8px',
-                whiteSpace: 'nowrap',
-              },
+              // 皮肤在注入的 `dsm-lingxi-pill-trigger` 里（照 WorkBuddy：纯文字、
+              // 无边框无底色、悬停才浮浅底、12px/18px、数字等宽）。
+              className: 'dsm-lingxi-pill-trigger',
               onClick: toggle,
             },
             label,
@@ -1842,24 +1997,122 @@
       }
 
       /**
-       * 胶囊的门控：只在**本插件的 provider** 被选中时显示。
+       * 胶囊的错误边界：宿主给每个槽位各自兜底的行为没有承诺，一次渲染异常
+       * 就可能让这一格**静默变空**（其它槽位照旧）。这里自己兜住：报一条
+       * 诊断，然后什么都不画，不把异常继续往宿主抛。
        *
-       * 余额属于「下一次请求真的会用的那个 provider」；选了别人的模型还显示灵犀的
-       * 余额，是一句看起来像事实的错误陈述。宿主没给投影时照常显示——
-       * 「我不知道」不该等于「藏起来」。
+       * 用 `React.Component` 是有前提的（类组件才能当错误边界），所以先看它
+       * 在不在：宿主给的 React 是完整的，但没理由因此让整个模块在残缺实现上
+       * 直接崩掉 —— 没有就退化成「不加边界、直接画胶囊」。
+       */
+      var PillBoundary;
+      if (typeof React.Component === 'function') {
+        PillBoundary = class PillBoundary extends React.Component {
+          constructor(props) {
+            super(props);
+            this.state = { failed: false };
+          }
+
+          static getDerivedStateFromError() {
+            return { failed: true };
+          }
+
+          componentDidCatch(error) {
+            report('pill-error', error && error.message ? error.message : String(error));
+          }
+
+          render() {
+            return this.state.failed === true ? null : this.props.children;
+          }
+        };
+      }
+
+      /**
+       * 胶囊的门控：只在**本插件的 provider** 被选中时显示（与 WorkBuddy 同一条规则）。
+       *
+       * 余额属于「下一次请求真的会用的那个 provider」；选了别人的模型、或者新会话还
+       * 没选模型（provider 未知），显示灵犀余额都是一句看起来像事实的错误陈述。
+       * 所以「不知道 provider」= 不显示。
+       *
+       * 读不到投影**一律不画**：新会话还没有 `modelSelection` 投影（`undefined`
+       * 是「这一格还没有值」，不是错误），旧规则把「读不到就放行」当逃生口，
+       * 结果几家插件的余额全堆进同一个输入框。现在只有确定 `provider` 是本插件
+       * 才画。诊断（`report` / `lastGate`）保留，但不再参与显示决定。
        */
       function CreditPillGate(props) {
-        var projection =
-          typeof props.useProjection === 'function' ? props.useProjection('modelSelection') : undefined;
-        var next = projection === undefined || projection === null ? undefined : (projection.next === undefined || projection.next === null ? projection.lastUsed : projection.next);
-        var provider = next === undefined ? undefined : next.provider;
-        if (provider !== undefined && provider !== PROVIDER_ID) return null;
-        return h(CreditPill, props);
+        // 宿主有时会用「不带 props」的方式渲染一次这一格（探测/空槽）。
+        // 那次渲染不是真实输入框：既没有会话可看，也没有余额可汇报。
+        // 以前这里直接 `props.useProjection` 会抛，抛出的错会把这一格整块
+        // 掀掉，于是「重启后胶囊消失」看起来像插件没更新。
+        var p = props === null || props === undefined ? undefined : props;
+        var provider;
+        var next;
+        var projectionUnreadable = false;
+        var label = p === undefined ? 'props=none' : 'provider=?';
+        try {
+          if (p === undefined) {
+            report('gate-noprops', 'slot rendered without props');
+          } else {
+            var projection =
+              typeof p.useProjection === 'function' ? p.useProjection('modelSelection') : undefined;
+            var candidate =
+              projection === undefined || projection === null
+                ? undefined
+                : projection.next === null || projection.next === undefined
+                  ? projection.lastUsed
+                  : projection.next;
+            // `lastUsed` 本身可以是 `null`（宿主自己就写得出来），
+            // 这里把它收敛成 `undefined`，后面的读取才安全。
+            next = candidate === null || candidate === undefined ? undefined : candidate;
+            provider = next === undefined ? undefined : next.provider;
+            label =
+              'use=' + String(provider) +
+              ' model=' + String(next === undefined ? undefined : next.model) +
+              ' hasNext=' + String(projection === undefined || projection === null ? 'no-projection' : projection.next !== undefined) +
+              ' last=' + projSelection(projection === undefined || projection === null ? undefined : projection.lastUsed) +
+              ' sess=' + String(p.sessionId) +
+              ' keys=' + Object.keys(p).sort().join(',');
+          }
+        } catch (error) {
+          // 读投影抛异常（宿主换了投影名、或者这一格不在会话作用域里）按
+          // 「读不到」处理：不画，只上报。这条以前是放行的逃生口，正是它把
+          // 几家插件的余额一起塞进了新会话的输入框。
+          report('gate-error', 'props=' + String(p === undefined ? 'none' : 'ok') + ' ' + (error && error.message ? error.message : String(error)) + ' @ ' + firstFrames(error));
+          provider = undefined;
+          projectionUnreadable = true;
+        }
+        lastGate = { provider: provider, model: next === undefined ? undefined : next.model, at: Date.now() };
+        // 诊断保留（用户靠「设置 → 诊断」那一行看门控状态），只是不影响显示决定。
+        report('gate', label + ' unreadable=' + String(projectionUnreadable));
+        // 没有 props 的渲染不是输入框：不画胶囊，也不该把这一格挂崩。
+        if (p === undefined) return null;
+        // 新会话还没选模型（provider 未知）→ 不显示；别的 provider → 不显示；
+        // 读投影抛异常（读不到）→ 也不显示。没有逃生口。
+        if (provider !== PROVIDER_ID) return null;
+        if (PillBoundary === undefined) return h(CreditPill, p);
+        return h(PillBoundary, null, h(CreditPill, p));
+      }
+
+      /** 异常栈的前几帧（诊断用，压成一行）。 */
+      function firstFrames(error) {
+        var stack = error && error.stack ? String(error.stack) : '';
+        return stack.replace(/s+/g, ' ').slice(0, 200);
+      }
+      /** 把一个 selection 摊成 `provider/model` 字符串（诊断用）。 */
+      function projSelection(selection) {
+        if (selection === undefined || selection === null) return 'none';
+        return String(selection.provider) + '/' + String(selection.model);
       }
 
       /** 插件模块。`inject` 声明依赖的服务，`apply` 在服务就绪时注册槽位。 */
       function apply(ctx) {
         var namespace = 'dsh-connect-lingxi';
+        report(
+          'apply',
+          'slots=' + (ctx.slots === undefined ? 'no' : 'yes') +
+            ' locale=' + (ctx.locale === undefined ? 'no' : 'yes') +
+            ' layout=' + (typeof ctx.get === 'function' ? 'get' : 'none'),
+        );
         if (typeof document !== 'undefined') {
           var cssId = 'dsh-connect-lingxi/client.css';
           var existing = document.querySelector('style[data-plugin-css="' + cssId + '"]');
@@ -1870,7 +2123,49 @@
             styleTag.textContent = LINGXI_PAGE_CSS;
             document.head.appendChild(styleTag);
           }
+          var orderCssId = 'dsh-connect-lingxi/model-label-order.css';
+          var orderExisting = document.querySelector('style[data-plugin-css="' + orderCssId + '"]');
+          if (orderExisting !== null) orderExisting.textContent = MODEL_LABEL_ORDER_CSS;
+          else {
+            var orderStyleTag = document.createElement('style');
+            orderStyleTag.dataset.pluginCss = orderCssId;
+            orderStyleTag.textContent = MODEL_LABEL_ORDER_CSS;
+            document.head.appendChild(orderStyleTag);
+          }
+          // 徽标样式先在 apply 里落一份底（藏宿主的 Tag）；具体每个模型的
+          // 胶囊等 `/status` 回来后由 `applyModelBadges` 补全。
+          var badgeCssId = 'dsh-connect-lingxi/model-badge.css';
+          var badgeExisting = document.querySelector('style[data-plugin-css="' + badgeCssId + '"]');
+          if (badgeExisting !== null) badgeExisting.textContent = MODEL_BADGE_BASE_CSS;
+          else {
+            var badgeStyleTag = document.createElement('style');
+            badgeStyleTag.dataset.pluginCss = badgeCssId;
+            badgeStyleTag.textContent = MODEL_BADGE_BASE_CSS;
+            document.head.appendChild(badgeStyleTag);
+          }
         }
+        // 输入框右侧的读数：宿主把 `input.right` 渲染在模型选择器**紧前面**。
+        // 注册放在 apply 的**最前面**：它下面还有主页面、插件详情页、设置页等
+        // 若干注册，任何一处意外抛异常都会让后面的注册整段不执行——胶囊这种
+        // 小东西不该排在它们后面等。
+        injectSlot('conversation.input.right', function () {
+          return ctx.slots.register(
+            {
+              name: 'conversation.input.right',
+              id: BUNDLE_NAME + '-credits',
+              order: 4,
+              locale: namespace,
+              inject: function () {
+                return { t: t, openPanel: getLayout() === undefined ? undefined : function () {
+                  var layout = getLayout();
+                  if (layout !== undefined) layout.selectPanel(PANEL_ID);
+                } };
+              },
+            },
+            CreditPillGate,
+          );
+        });
+
         function getLayout() {
           try {
             var layout = ctx.get('layout');
@@ -1912,16 +2207,24 @@
          */
         function injectSlot(name, register) {
           try {
-            return ctx.slots.inject(name, function () {
+            var handle = ctx.slots.inject(name, function () {
               try {
-                return register();
+                var result = register();
+                // 注册成功是「槽位里有我们」的唯一证据：宿主没渲染这一格时，
+                // 回调根本不会执行，这条就不会出现。
+                report('slot', name + ' registered');
+                return result;
               } catch (error) {
                 console.error('[dsh-connect-lingxi] 槽位注册失败（' + name + '，不影响模型路由）：', error);
+                report('slot-error', name + ': ' + (error && error.message ? error.message : String(error)));
                 return undefined;
               }
             });
+            report('slot-inject', name);
+            return handle;
           } catch (error) {
             console.error('[dsh-connect-lingxi] 槽位注入失败（' + name + '，不影响模型路由）：', error);
+            report('slot-inject-error', name + ': ' + (error && error.message ? error.message : String(error)));
           }
         }
 
@@ -1996,222 +2299,6 @@
           );
         });
 
-        // 输入框右侧的读数：宿主把 `input.right` 渲染在模型选择器**紧前面**。
-        /**
-         * 模型名 + `· x倍率` + 徽标（`conversation.input.model.label`）。
-         *
-         * 为什么要自己画：宿主只把 `model.name` 当字符串画出来，倍率与徽标得贴上去
-         * 才看得见（参考界面里是 `DeepSeek-V4.1-Flash · x0.11` + 绿色徽标）。
-         * 倍率是选模型时唯一要比的数字，藏在两层菜单里等于没有。
-         *
-         * 别人的模型行必须**按原样还回去**（名字 + 它自己的徽标）：这个槽位在宿主上
-         * 是 `single` —— 只有一个格子，谁注册谁独占。一个「只输出纯文本」的占位者
-         * 一样占着格子，所以返回 null 也不会把格子让出来。宿主自己的 1017 徽标只在
-         * **没有占位者**时由它自己画，因此一旦我们占了格子，就必须替别人的行补画
-         * `model.badge`，否则那个徽标会从它自己的行上消失。
-         */
-        function ModelLabel(props) {
-          var model = props === undefined || props === null ? undefined : props.model;
-          var provider = props === undefined || props === null ? undefined : props.provider;
-          if (model === undefined || model === null) return h('span', null, '');
-          var name = String(model.name === undefined || model.name === null ? model.id : model.name);
-          var theirs = provider === undefined || provider === null || provider.id !== PROVIDER_ID;
-          var badge = model.badge === undefined || model.badge === null ? undefined : model.badge;
-          if (theirs) {
-            var foreign = [h('span', { key: 'name' }, name)];
-            if (badge !== undefined && badge.text !== undefined) {
-              foreign.push(
-                h(BadgeChip, {
-                  key: 'badge',
-                  text: localizedText(badge.text),
-                  tone: badge.tone,
-                }),
-              );
-            }
-            return h(
-              'span',
-              { style: { display: 'inline-flex', alignItems: 'center', gap: '4px', minWidth: 0 } },
-              foreign,
-            );
-          }
-          return h(LingxiModelLabel, { model: model });
-        }
-
-        /**
-         * 本插件模型的名字：`名字 · x0.12` + 徽标胶囊。
-         *
-         * 倍率从状态文档的目录里拿（`models[].multiplier`），不再从 `description`
-         * 里解析 —— 那个字符串是给人看的，随时可能改格式。状态还没读到时只画名字，
-         * 不猜一个倍率出来。
-         */
-        function LingxiModelLabel(props) {
-          var model = props.model;
-          var state = useStatus();
-          var multiplier = findMultiplier(state[0], model.id);
-          var badge = model.badge === undefined || model.badge === null ? undefined : model.badge;
-          var parts = [
-            h('span', { key: 'name' }, String(model.name === undefined ? model.id : model.name)),
-          ];
-          if (multiplier !== '') {
-            parts.push(h('span', { key: 'rate', style: { opacity: 0.65 } }, ' · x' + multiplier));
-          }
-          if (badge !== undefined && badge.text !== undefined) {
-            parts.push(
-              h(BadgeChip, { key: 'badge', text: localizedText(badge.text), tone: badge.tone }),
-            );
-          }
-          return h(
-            'span',
-            { style: { display: 'inline-flex', alignItems: 'center', gap: '4px', minWidth: 0 } },
-            parts,
-          );
-        }
-
-        /** 徽标胶囊：颜色只看 `tone`，文字用宿主给的那份。 */
-        function BadgeChip(props) {
-          var tone = props.tone;
-          var color =
-            tone === 'success'
-              ? 'var(--dsw-alias-label-success, #3aa757)'
-              : tone === 'warning'
-                ? 'var(--dsw-alias-label-warning, #d98a1f)'
-                : tone === 'info'
-                  ? 'var(--dsw-alias-label-info, #3b82f6)'
-                  : 'var(--dsw-alias-label-tertiary, #8b8f98)';
-          return h(
-            'span',
-            {
-              style: {
-                flex: 'none',
-                border: '1px solid ' + color,
-                borderRadius: '999px',
-                color: color,
-                fontSize: '11px',
-                lineHeight: 1.3,
-                padding: '0 6px',
-                whiteSpace: 'nowrap',
-              },
-            },
-            props.text,
-          );
-        }
-
-        /** 状态文档里这个模型的倍率；没有就是空串（不是「0」）。 */
-        function findMultiplier(status, modelId) {
-          if (status === undefined || status === null || !Array.isArray(status.models)) return '';
-          for (var index = 0; index < status.models.length; index += 1) {
-            var item = status.models[index];
-            if (item !== undefined && item !== null && item.id === modelId) {
-              return typeof item.multiplier === 'string' ? item.multiplier : '';
-            }
-          }
-          return '';
-        }
-
-        /**
-         * 徽标文案可能是字面量，也可能是按语言分开的翻译（宿主的 `LocalizedText`）。
-         * 宿主给了翻译就挑当前语言那份 —— 把 `{en, zh}` 画成 `[object Object]` 是
-         * 最糟糕的结果，比显示错语言的单词还差。
-         */
-        function localizedText(text) {
-          if (typeof text === 'string') return text;
-          if (text === undefined || text === null || typeof text !== 'object') return '';
-          var locale = currentLocale();
-          if (typeof text[locale] === 'string') return text[locale];
-          var dash = locale.indexOf('-');
-          var base = dash === -1 ? locale : locale.slice(0, dash);
-          if (typeof text[base] === 'string') return text[base];
-          if (typeof text.en === 'string') return text.en;
-          var keys = Object.keys(text);
-          return keys.length === 0 ? '' : String(text[keys[0]]);
-        }
-
-        /** 当前界面语言（`zh-CN` 这种）；读不到就当中文。 */
-        function currentLocale() {
-          try {
-            if (
-              typeof document !== 'undefined' &&
-              document !== null &&
-              document.documentElement !== null &&
-              typeof document.documentElement.lang === 'string' &&
-              document.documentElement.lang !== ''
-            ) {
-              return document.documentElement.lang.toLowerCase();
-            }
-            if (
-              typeof navigator !== 'undefined' &&
-              navigator !== null &&
-              typeof navigator.language === 'string'
-            ) {
-              return navigator.language.toLowerCase();
-            }
-          } catch (error) {
-            // 读不到语言不值得报错：下面按中文处理。
-          }
-          return 'zh';
-        }
-
-        /**
-         * 模型标签席位的优先级：**必须小于 0**。
-         *
-         * 这是 `single` 槽位：只有一个格子，同一优先级上第二份注册会直接抛
-         * （「already has a registration at priority 0 — register at a different
-         * priority to shadow it」）。宿主自己在 priority 0 注册了官方模型徽标，
-         * 所以 0 是必冲突的位置，负数才是「盖在它上面」。
-         */
-        var MODEL_LABEL_PRIORITY = -105;
-
-        /** 读槽位声明的形态；读不到就当 `undefined`（按单格子处理）。 */
-        function declaredSlotKind(name) {
-          var slots = ctx === undefined || ctx === null ? undefined : ctx.slots;
-          if (slots === undefined || slots === null || typeof slots.spec !== 'function') return undefined;
-          var spec;
-          try {
-            spec = slots.spec(name);
-          } catch (error) {
-            return undefined;
-          }
-          var kind = spec === undefined || spec === null ? undefined : spec.kind;
-          if (kind === 'single' || kind === 'keyed' || kind === 'list' || kind === 'chain') return kind;
-          return undefined;
-        }
-
-        /**
-         * 模型名后面贴倍率与徽标。
-         *
-         * `keyed` 宿主上每家 provider 一个格子，各画各的，宿主的 1017 徽标不受影响；
-         * 其它形态（含读不到）只注册一份，用负优先级盖住宿主的默认标签 ——
-         * 那时就得替别人的行补画徽标，见 {@link ModelLabel}。
-         */
-        injectSlot('conversation.input.model.label', function () {
-          var name = 'conversation.input.model.label';
-          var kind = declaredSlotKind(name);
-          // 列表/链式槽位不是「一个格子里的标签」，注册进去只会画出一堆重复的。
-          if (kind === 'list' || kind === 'chain') return undefined;
-          // 这个槽位声明的是 `registerOptions: []`：只认 `priority`（`keyed` 上再加
-          // `key`）。塞 `id` / `locale` / `inject` 是没用的字段，甚至可能被宿主拒掉。
-          var options = { name: name, priority: MODEL_LABEL_PRIORITY };
-          if (kind === 'keyed') options.key = PROVIDER_ID;
-          return ctx.slots.register(options, ModelLabel);
-        });
-
-        injectSlot('conversation.input.right', function () {
-          return ctx.slots.register(
-            {
-              name: 'conversation.input.right',
-              id: BUNDLE_NAME + '-credits',
-              order: 4,
-              locale: namespace,
-              inject: function () {
-                return { t: t, openPanel: getLayout() === undefined ? undefined : function () {
-                  var layout = getLayout();
-                  if (layout !== undefined) layout.selectPanel(PANEL_ID);
-                } };
-              },
-            },
-            CreditPillGate,
-          );
-        });
 
         /**
          * 设置页侧栏入口（参考 DSH 自带设置的布局：左侧导航 + 右侧整页）。
@@ -2282,6 +2369,9 @@
             },
           );
         });
+        // apply 走到底了：上面每一条 `slot-inject` 都应该出现，缺哪条就是
+        // 在哪一步中断的（中途抛异常，后面的注入不会执行）。
+        report('apply-done', 'all slots injected');
       }
 
       return {

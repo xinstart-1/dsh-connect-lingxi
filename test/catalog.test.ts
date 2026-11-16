@@ -11,7 +11,13 @@ import {
   parsePlans,
   STATIC_CATALOG,
 } from '../src/protocol/catalog.ts';
-import { badgeText, modelDescription, toLlmModelInfos } from '../src/llm/adapter.ts';
+import {
+  badgeText,
+  catalogName,
+  modelDescription,
+  toLlmModelInfos,
+  withCatalogDetails,
+} from '../src/llm/adapter.ts';
 
 test('静态兜底与官网清单一致：11 个模型 + 2 个模式，id 唯一', () => {
   // 这张表是「模型展示与官网同步」的唯一事实来源，条数变化必须是有意的。
@@ -159,7 +165,7 @@ test('同名 id 去重，先出现者胜出', () => {
   assert.equal(deduped[0]?.name, '一');
 });
 
-test('下拉说明只放上游文案，倍率交给模型名那块标签', () => {
+test('下拉说明只放上游文案，倍率并进模型名', () => {
   // 同一个下拉里两种格式并存时，倍率（选模型要比的那个数）会在部分行里消失。
   const withBoth = modelDescription({
     id: 'a',
@@ -171,7 +177,7 @@ test('下拉说明只放上游文案，倍率交给模型名那块标签', () =>
     vision: false,
     description: '适用于日常任务',
   });
-  assert.equal(withBoth, '适用于日常任务', '倍率由模型名标签画，说明里不再重复');
+  assert.equal(withBoth, '适用于日常任务', '倍率并进模型名，说明里不再重复');
 
   const onlyMultiplier = modelDescription({
     id: 'b',
@@ -234,6 +240,58 @@ test('徽标原样透传给选择器，且语气按文案分档', () => {
 
   // 没有徽标的行不要凭空造一个：选择器里的标签是上游的事实。
   assert.equal(infos.find((info) => info.id === 'kimi-k3')?.badge, undefined);
+});
+
+test('选择器的模型名带官网原文倍率：`名字 · ~0.12x`', () => {
+  const byId = new Map(STATIC_CATALOG.map((model) => [model.id, model]));
+  const flash = byId.get('deepseek-v4.1-flash');
+  assert.ok(flash !== undefined);
+  // 倍率并进名字，连 `~` 一起照抄：那是官网「折扣价」的标记，不是排版噪声。
+  assert.equal(catalogName(flash), 'DeepSeek V4.1 Flash · ~0.12x');
+
+  const kimi = byId.get('kimi-k3');
+  assert.ok(kimi !== undefined);
+  assert.equal(catalogName(kimi), 'Kimi-K3 · 1.60x');
+
+  // 模式没有倍率：名字原样，不能拼出一个空 ` · `。
+  const plan = byId.get('plan_pro');
+  assert.ok(plan !== undefined);
+  assert.equal(catalogName(plan), plan.name);
+});
+
+test('宿主读的 listModels 也带倍率与徽标（选择器只认这条路）', () => {
+  // pi-ai 的 listModels 只会原样回这四个字段；不补，下拉里就只剩一个干名字。
+  const raw = [
+    {
+      provider: 'wps-lingxi',
+      id: 'deepseek-v4.1-flash',
+      name: 'DeepSeek V4.1 Flash',
+      inputModalities: ['text', 'image'] as const,
+    },
+    {
+      provider: 'wps-lingxi',
+      id: 'kimi-k3',
+      name: 'Kimi-K3',
+      inputModalities: ['text'] as const,
+    },
+  ];
+  const decorated = withCatalogDetails(raw, STATIC_CATALOG);
+  const flash = decorated.find((info) => info.id === 'deepseek-v4.1-flash');
+  assert.equal(flash?.name, 'DeepSeek V4.1 Flash · ~0.12x');
+  assert.equal(flash?.badge?.text, 'NEW');
+  assert.equal(flash?.inputModalities?.includes('image'), true, '原有字段不能被覆盖掉');
+
+  const kimi = decorated.find((info) => info.id === 'kimi-k3');
+  assert.equal(kimi?.name, 'Kimi-K3 · 1.60x');
+  assert.equal(kimi?.badge, undefined, '没有徽标的行不凭空造一个');
+
+  // 目录里没有的 id（比如目录换了一代）：原样还回去，别让一行脏数据毁掉整个下拉。
+  const unknown = withCatalogDetails(
+    [{ provider: 'wps-lingxi', id: 'not-in-catalog', name: 'Old Model' }],
+    STATIC_CATALOG,
+  );
+  assert.equal(unknown[0]?.name, 'Old Model');
+  assert.equal(unknown[0]?.badge, undefined);
 });
 
 test('徽标文案：中文标签给英文说法，认不出的原样透传', () => {

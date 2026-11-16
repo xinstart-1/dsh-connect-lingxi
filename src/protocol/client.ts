@@ -18,6 +18,7 @@ import {
   BASE,
   DEVICE_ID,
   KDOCS_BASE,
+  MAX_PROMPT_TOKENS,
   PLANS_PATH,
   PROFILE_PATH,
   REQUEST_TIMEOUT_MS,
@@ -25,7 +26,6 @@ import {
   VERSION,
   TASKS_PATH,
 } from '../constants.ts';
-import { fitAgentBody } from './budget.ts';
 import { normalizeModelId, parsePlans, type LingxiModel } from './catalog.ts';
 import { classifyUpstreamError, LingxiError, looksLikeStaleRun } from './errors.ts';
 import { agentHeaders, basicHeaders, normalizeUserCookie } from './headers.ts';
@@ -512,10 +512,15 @@ export class LingxiClient {
   ): Promise<Response> {
     const model = normalizeModelId(request.model);
     const body = buildAgentBody(request, model);
+    const payload = JSON.stringify(body);
+    const estimatedTokens = estimatePromptTokens(
+      body.messages,
+      body.tools === undefined ? '' : JSON.stringify(body.tools),
+    );
     const response = await this.request(`${run.base}${AGENT_CHAT_PATH}`, {
       method: 'POST',
       headers: agentHeaders(cookie, run.base, { sessionId: run.sessionId, runId: run.runId }),
-      body: JSON.stringify(body),
+      body: payload,
       signal: request.signal,
     });
     if (!response.ok) {
@@ -534,7 +539,7 @@ export class LingxiClient {
       throw classifyUpstreamError(
         response.status,
         parsed,
-        `灵犀对话失败 〔v${VERSION} · ${describeShape(body.messages)} · ${dumpPath}〕`,
+        `灵犀对话失败 〔v${VERSION} · ${describeShape(body.messages)} · ${dumpPath}${oversizeNote(estimatedTokens)}〕`,
       );
     }
     if (response.body === null) throw new LingxiError('灵犀上游没有返回响应体', 502);
@@ -661,11 +666,57 @@ function safeUserName(): string {
 }
 
 /**
- * OpenAI 请求 → 灵犀请求体。字段映射见 `docs/PROTOCOL.md` §3.3。
- * @param request - 本地请求。
- * @param model - 已归一的上游模型 key。
- * @returns 上游请求体（已按预算裁剪）。
+ * 粗略估计 prompt 的 token 数。
+ *
+ * 灵犀没有公开 tokenizer；实测（2026-11-11，`deepseek-v4.1-flash`）：
+ * - 4,194,304 字节纯英文 → `prompt_tokens = 932,102`（≈4.5 字符/token）；
+ * - 同样 4,194,304 字节中文 → `prompt_tokens = 735,881`（≈1.9 字符/token）。
+ *
+ * 按「ASCII 4.5 字符/token、其余 1.9 字符/token」折算。只用于**超限提示**，
+ * 精度 ±10% 足够：它决定「要不要提醒」，不决定「能不能发」。
+ * @param messages - 上游 messages（原始或已归一都行，只看文本）。
+ * @param extraText - 额外要计入的文本（例如 tools 的 JSON）。
+ * @returns 估计的 prompt token 数。
  */
+export function estimatePromptTokens(messages: unknown, extraText = ''): number {
+  let ascii = 0;
+  let wide = 0;
+  const add = (text: string): void => {
+    for (const char of text) {
+      const code = char.codePointAt(0) ?? 0;
+      if (code <= 0x7f) ascii += 1;
+      else wide += 1;
+    }
+  };
+  if (Array.isArray(messages)) {
+    for (const message of messages) {
+      const content = (message as { content?: unknown } | null)?.content;
+      if (typeof content === 'string') {
+        add(content);
+      } else if (Array.isArray(content)) {
+        for (const part of content) {
+          const text = (part as { text?: unknown } | null)?.text;
+          if (typeof text === 'string') add(text);
+        }
+      }
+    }
+  }
+  add(extraText);
+  return Math.round(ascii / 4.5 + wide / 1.9);
+}
+
+/**
+ * 估计 token 接近上限时拼进错误信息的说明。
+ *
+ * **不裁剪、不压缩**：完整历史照发；这里只在上游真拒绝时告诉用户原因。
+ * @param tokens - {@link estimatePromptTokens} 的结果。
+ * @returns 接近上限时的说明后缀；否则空串。
+ */
+export function oversizeNote(tokens: number): string {
+  if (tokens < MAX_PROMPT_TOKENS * 0.9) return '';
+  return ` · 本轮约 ${Math.round(tokens / 10000)} 万 token，已接近灵犀 100 万 token 上限；插件不会自动裁剪或压缩历史，请新开会话或手动清理历史后重试`;
+}
+
 /**
  * 把 messages 的形状压成一行，用来在报错里认领问题。
  *
@@ -687,6 +738,15 @@ export function describeShape(messages: unknown): string {
   return parts.join(',');
 }
 
+/**
+ * OpenAI 请求 → 灵犀请求体。字段映射见 `docs/PROTOCOL.md` §3.3。
+ *
+ * **不裁剪历史**：messages 原样发出（只做上游不接受的形状归一）。上游若按请求
+ * 长度拒绝，由 {@link oversizeNote} 在错误里说明，不再静默丢历史或截断长消息。
+ * @param request - 本地请求。
+ * @param model - 已归一的上游模型 key。
+ * @returns 上游请求体。
+ */
 export function buildAgentBody(
   request: ChatRequest,
   model: string,
@@ -732,12 +792,6 @@ export function buildAgentBody(
     body.llm_arguments = { reasoning_effort: effort };
   }
 
-  const fitted = fitAgentBody(body);
-  if ((fitted.dropped > 0 || fitted.elided > 0) && request.onWarn !== undefined) {
-    request.onWarn(
-      `提示词超过预算，已省略 ${fitted.dropped} 条历史、截断 ${fitted.elided} 条长消息`,
-    );
-  }
   return body;
 }
 

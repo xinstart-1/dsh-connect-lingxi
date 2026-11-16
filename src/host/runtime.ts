@@ -59,6 +59,13 @@ export interface RuntimeOptions {
   fallbackCatalog: () => readonly LingxiModel[];
   /** 插件版本号，写进状态文档供卡片显示。 */
   version: string;
+  /**
+   * 客户端模块注册表的观察入口（可选）。
+   *
+   * 由 `index.ts` 用 `ctx.inject(['clientModules'])` 装好：那之后才有东西可读。
+   * 纯 CLI 组合里没有这个服务，诊断快照里就没有这一段。
+   */
+  clientModules?: () => unknown;
   /** 诊断日志。 */
   warn: (message: string) => void;
   /** 时钟（测试可替换）。 */
@@ -108,6 +115,9 @@ interface Segment<T> {
   at: number;
 }
 
+/** 客户端诊断事件的保留条数（环形缓冲，够看清一次页面加载的顺序即可）。 */
+const CLIENT_REPORT_LIMIT = 60;
+
 /** 上游失败时的统一措辞：原文照留，便于用户整段贴进问题反馈。 */
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -139,6 +149,14 @@ export class LingxiRuntime {
   private refreshing?: Promise<StatusDocument>;
   private timer?: NodeJS.Timeout;
   private readers = 0;
+  /**
+   * 浏览器半侧报上来的诊断事件（只在内存里，重启即清空）。
+   *
+   * 为什么要有它：客户端半侧跑在宿主渲染器里，槽位没声明、回调抛异常、
+   * 门控把胶囊挡了——这三种原因在界面上都是「什么都没有」，宿主控制台
+   * 又不归我们看。让客户端把判断报回来，`/diag` 才说得清发生过什么。
+   */
+  private clientReports: Array<{ at: number; event: string; detail: string; page: string }> = [];
 
   constructor(options: RuntimeOptions) {
     this.options = options;
@@ -214,9 +232,59 @@ export class LingxiRuntime {
         return this.claimOneTime();
       case 'settings':
         return this.applySettings(body);
+      case 'client-report':
+        return this.recordClientReport(body);
       default:
         return { ok: false, error: `未知操作: ${String(action)}` };
     }
+  }
+
+  /**
+   * 收一条浏览器半侧的诊断事件。
+   *
+   * 只保留最近 {@link CLIENT_REPORT_LIMIT} 条：这是排查用的环形缓冲，
+   * 不是审计日志；轮询上报的同一个事件在客户端已经限流。
+   * @param body - `{ event, detail, page }`，超出长度的截断。
+   * @returns 固定回执（客户端不依赖内容）。
+   */
+  private recordClientReport(body: Record<string, unknown>): unknown {
+    const event = typeof body.event === 'string' ? body.event.slice(0, 80) : '';
+    if (event === '') return { ok: false, error: '缺少 event' };
+    this.clientReports.push({
+      at: this.now(),
+      event,
+      detail: typeof body.detail === 'string' ? body.detail.slice(0, 300) : '',
+      page: typeof body.page === 'string' ? body.page.slice(0, 160) : '',
+    });
+    if (this.clientReports.length > CLIENT_REPORT_LIMIT) {
+      this.clientReports.splice(0, this.clientReports.length - CLIENT_REPORT_LIMIT);
+    }
+    return { ok: true };
+  }
+
+  /**
+   * 诊断快照：客户端上报过什么 + 宿主侧对客户端模块的观察。
+   *
+   * 只读、不碰上游、不阻塞：`/diag` 是排查通道，用户随时可能打开。
+   * 这里刻意不返回 cookie、账号 id、余额之外的东西。
+   */
+  diag(): unknown {
+    let clientModules: unknown;
+    try {
+      clientModules = this.options.clientModules === undefined ? undefined : this.options.clientModules();
+    } catch (error) {
+      clientModules = { error: messageOf(error) };
+    }
+    return {
+      version: this.options.version,
+      at: this.now(),
+      pid: process.pid,
+      uptimeMs: Math.round(process.uptime() * 1000),
+      clientModules,
+      client: {
+        reports: this.clientReports,
+      },
+    };
   }
 
   /**

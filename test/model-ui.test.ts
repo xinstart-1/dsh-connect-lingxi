@@ -255,6 +255,10 @@ function boot(document: unknown): Booted {
 
   g.fetch = (url: string, init?: { method?: string; body?: string }) => {
     if (init?.method === 'POST') {
+      // 诊断上报不算「用户写操作」：它们也走 POST，但不该出现在断言里。
+      if (url.includes('client-report')) {
+        return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true }) });
+      }
       posts.push({ url, body: JSON.parse(init.body ?? '{}') });
       return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true }) });
     }

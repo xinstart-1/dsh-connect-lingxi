@@ -259,3 +259,47 @@ test('shim：run 缓存命中时不重复建会话', async () => {
     globalThis.fetch = original;
   }
 });
+
+test('shim：超长 prompt 的「AI服务异常」补一句 1M token 说明，短 prompt 不补', async () => {
+  const upstream = fakeUpstream({
+    sseFrames: upstreamFrames({
+      code: 'AIError',
+      message: 'AI服务异常',
+      usage: { completion_tokens: 0, prompt_tokens: 0, total_tokens: 0, cached_tokens: 0 },
+      choices: [],
+    }),
+  });
+  const original = globalThis.fetch;
+  globalThis.fetch = upstream.fetch;
+  const shim = await startShim({ cookie: async () => 'wps_sid=abc' });
+  const send = async (content: string): Promise<string> => {
+    const response = await realFetch(`${shim.baseUrl}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${shim.token}`,
+      },
+      body: JSON.stringify({
+        model: 'deepseek-v4.1-flash',
+        stream: true,
+        messages: [{ role: 'user', content }],
+      }),
+    });
+    return response.text();
+  };
+  try {
+    // 约 430 万英文字符 ≈ 95 万 token，过提示线（上限的 90%）。
+    const longText = await send('x'.repeat(4_300_000));
+    assert.match(longText, /AI服务异常/);
+    assert.match(longText, /100 万 token/);
+    assert.match(longText, /不会自动裁剪或压缩/);
+
+    // 短 prompt 同样报 AI服务异常，但不该冒出「接近上限」的提示。
+    const shortText = await send('嗨');
+    assert.match(shortText, /AI服务异常/);
+    assert.doesNotMatch(shortText, /100 万 token/);
+  } finally {
+    await shim.close();
+    globalThis.fetch = original;
+  }
+});

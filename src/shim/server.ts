@@ -16,7 +16,7 @@ import { randomBytes } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { SHIM_PREFIX } from '../constants.ts';
-import { LingxiClient, type WireMessage } from '../protocol/client.ts';
+import { LingxiClient, estimatePromptTokens, oversizeNote, type WireMessage } from '../protocol/client.ts';
 import { foldFrames, LingxiSseTranslator } from '../protocol/sse.ts';
 
 /** shim 启动后的句柄。 */
@@ -181,10 +181,20 @@ export async function startShim(options: ShimOptions): Promise<ShimHandle> {
         sawError = true;
         const message = error instanceof Error ? error.message : String(error);
         const code = (error as { code?: unknown })?.code;
+        // 超长 prompt 上游不报「太长」，而是回 `AIError / AI服务异常`（HTTP 仍 200）。
+        // 这时按估计 token 补一句人话，否则用户只能看到一句「AI服务异常」。
+        const hint = /AIError|AI服务异常/i.test(message)
+          ? oversizeNote(
+              estimatePromptTokens(
+                messages,
+                Array.isArray(parsed.tools) ? JSON.stringify(parsed.tools) : '',
+              ),
+            )
+          : '';
         res.write(
           `data: ${JSON.stringify({
             error: {
-              message,
+              message: `${message}${hint}`,
               type: 'upstream_error',
               ...(typeof code === 'string' ? { code } : {}),
             },

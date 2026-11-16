@@ -7,7 +7,7 @@
 export const PROVIDER = 'wps-lingxi';
 
 /** 插件版本号（卡片与日志显示）。与 package.json 的 version 保持一致。 */
-export const VERSION = '0.0.15';
+export const VERSION = '0.0.20';
 
 /** 设置页命名空间（插件设置卡片的挂载点）。 */
 export const SETTINGS_NS = 'lingxi';
@@ -55,8 +55,18 @@ export const KSO_COOKIE_PARTS = [
 /** run 缓存有效期（1 小时）。 */
 export const RUN_TTL_MS = 60 * 60 * 1000;
 
-/** 提示词预算（KB）；超出时按最旧优先丢弃历史。 */
-export const MAX_PROMPT_KB = 320;
+/**
+ * 单轮 prompt 的 token 上限（灵犀 1M 上下文的实际上限）。
+ *
+ * **已实测**（2026-11-11，`deepseek-v4.1-flash`，`scripts` 外部探针）：
+ * - 英文 4096KB（4,194,304 字节）→ `prompt_tokens = 932,102`，200 正常；
+ * - 英文 4607KB 正常、4608KB 起返回 `HTTP 200 + SSE AIError/AI服务异常`（usage 全 0）；
+ * - 同样 4608KB 的中文只有约 175 万字符，正常通过 —— 限制是 token，不是字节。
+ *
+ * **不用于自动裁剪/压缩**：历史原样发出；只在估计接近上限、或上游以
+ * `AI服务异常` 拒绝时，用它在错误信息里说明原因（见 `oversizeNote`）。
+ */
+export const MAX_PROMPT_TOKENS = 1_048_576;
 
 /** 单次上游请求的默认超时。 */
 export const REQUEST_TIMEOUT_MS = 120_000;
@@ -78,3 +88,4 @@ export const REQUEST_IMAGE_BUDGETS = {
   maxRequestImages: 8,
   imageOffloadCountQuantum: 4,
 } as const;
+
